@@ -2,6 +2,10 @@ node_modules
 dist
 oc-workspace
 api-keys.json
+test
+docs
+.github
+vitest.config.ts
 .git
 .gitignore
 *.log

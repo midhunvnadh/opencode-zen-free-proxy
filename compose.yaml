@@ -1,7 +1,8 @@
 # Getting started:  docker compose up -d --build   (then read the API key it logs)
 #
 # PORT changes the port on your machine only; the container always listens on
-# 8790. Everything else is configured with the env vars documented in README.md.
+# 8790. Everything else is configured with the env vars documented in
+# docs/configuration.md.
 services:
   proxy:
     build: .

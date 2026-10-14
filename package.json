@@ -7,14 +7,18 @@
     "start": "bun src/server.ts",
     "dev": "bun --watch src/server.ts",
     "build": "bun build src/server.ts --target=bun --minify --outfile dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "bun run typecheck && bun run test"
   },
   "dependencies": {
     "hono": "^4.13.13"
   },
   "devDependencies": {
     "@types/bun": "^1.4.3",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
   },
   "license": "MIT",
   "engines": {
