@@ -1,70 +1,101 @@
 // @ts-nocheck
+import type { SSEStream } from "hono/streaming";
 import { mapFinish, anthropicStopReason } from "./messages.ts";
 import { rid } from "./lib/id.ts";
 import { nowSeconds } from "./lib/time.ts";
-import { writeSafe, sseHead } from "./lib/sse.ts";
 
 function remainingText(full: any, sent: any): string {
   return !sent ? full || "" : full && full.startsWith(sent) ? full.slice(sent.length) : "";
 }
-export function openaiSink(res: any, modelId: string) {
+
+// Frames are buffered until the route attaches the response stream. That is what
+// lets the route answer with a plain JSON error while nothing has reached the
+// client yet, and commit to SSE only once the first token is on the wire.
+function buffer() {
+  const queue: { data: string; event?: string }[] = [];
+  let response: SSEStream | null = null;
+  let opened = false;
+  let markOpened!: () => void;
+  const whenOpened = new Promise<void>((resolve) => { markOpened = resolve; });
+  // Hono closes the stream as soon as its callback returns, so writes are chained
+  // and `flush` is what guarantees the last frames are on the wire by then.
+  let chain: Promise<unknown> = Promise.resolve();
+  const enqueue = (frame: { data: string; event?: string }) => {
+    chain = chain.then(() => response?.writeSSE(frame));
+  };
+  return {
+    whenOpened,
+    get opened() { return opened; },
+    attach(sse: SSEStream) {
+      response = sse;
+      for (const frame of queue) enqueue(frame);
+      queue.length = 0;
+    },
+    send(data: string, event?: string) {
+      if (response?.aborted) return false;
+      if (!opened) { opened = true; markOpened(); }
+      const frame = { data, ...(event ? { event } : {}) };
+      if (response) enqueue(frame);
+      else queue.push(frame);
+      return true;
+    },
+    flush() { return chain; },
+  };
+}
+
+export function openaiSink(modelId: string) {
   const id = rid("chatcmpl-");
   const created = nowSeconds();
-  let opened = false;
+  const out = buffer();
   let sentText = "";
   let sentReasoning = "";
-  const chunk = (delta: any, finish: any, usage: any) =>
-    `data: ${JSON.stringify({
+  const chunk = (delta: any, finish?: any, usage?: any) =>
+    out.send(JSON.stringify({
       id, object: "chat.completion.chunk", created, model: modelId,
       choices: [{ index: 0, delta, finish_reason: finish ?? null }],
       ...(usage ? { usage } : {}),
-    })}\n\n`;
-  const open = () => {
-    if (opened) return true;
-    if (res.writableEnded || res.destroyed) return false;
-    opened = true;
-    sseHead(res);
-    writeSafe(res, chunk({ role: "assistant" }));
-    return true;
-  };
+    }));
+  const open = () => out.opened || chunk({ role: "assistant" });
   return {
-    get opened() { return opened; },
+    whenOpened: out.whenOpened,
+    get opened() { return out.opened; },
+    attach: out.attach,
     delta(kind: string, text: string) {
       if (!open()) return;
-      if (kind === "reasoning") { sentReasoning += text; writeSafe(res, chunk({ reasoning_content: text })); }
-      else { sentText += text; writeSafe(res, chunk({ content: text })); }
+      if (kind === "reasoning") { sentReasoning += text; chunk({ reasoning_content: text }); }
+      else { sentText += text; chunk({ content: text }); }
     },
     finish(r: any) {
       if (!open()) return;
       const reasoning = remainingText(r.reasoning, sentReasoning);
       const text = remainingText(r.text, sentText);
-      if (reasoning) writeSafe(res, chunk({ reasoning_content: reasoning }));
-      if (text) writeSafe(res, chunk({ content: text }));
-      writeSafe(res, chunk({}, mapFinish(r.finish), {
+      if (reasoning) chunk({ reasoning_content: reasoning });
+      if (text) chunk({ content: text });
+      chunk({}, mapFinish(r.finish), {
         prompt_tokens: r.inputTokens,
         completion_tokens: r.outputTokens,
         total_tokens: r.inputTokens + r.outputTokens,
-      }));
-      writeSafe(res, "data: [DONE]\n\n");
-      try { res.end(); } catch {}
+      });
+      out.send("[DONE]");
+      return out.flush();
     },
     fail(message: string) {
       if (!open()) return;
-      writeSafe(res, `data: ${JSON.stringify({ error: { message } })}\n\n`);
-      writeSafe(res, "data: [DONE]\n\n");
-      try { res.end(); } catch {}
+      out.send(JSON.stringify({ error: { message } }));
+      out.send("[DONE]");
+      return out.flush();
     },
   };
 }
 
-export function anthropicSink(res: any, modelId: string) {
+export function anthropicSink(modelId: string) {
   const id = rid("msg_");
-  let opened = false;
+  const out = buffer();
   let block: string | null = null;
   let index = -1;
   let sentText = "";
   let sentReasoning = "";
-  const send = (event: string, data: any) => writeSafe(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const send = (event: string, data: any) => out.send(JSON.stringify(data), event);
   const openBlock = (type: string) => {
     if (block === type) return;
     if (block) send("content_block_stop", { type: "content_block_stop", index });
@@ -76,20 +107,13 @@ export function anthropicSink(res: any, modelId: string) {
       content_block: type === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" },
     });
   };
-  const open = () => {
-    if (opened) return true;
-    if (res.writableEnded || res.destroyed) return false;
-    opened = true;
-    sseHead(res);
-    send("message_start", {
-      type: "message_start",
-      message: {
-        id, type: "message", role: "assistant", content: [], model: modelId,
-        stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    });
-    return true;
-  };
+  const open = () => out.opened || send("message_start", {
+    type: "message_start",
+    message: {
+      id, type: "message", role: "assistant", content: [], model: modelId,
+      stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  });
   const emit = (type: string, text: string) => {
     openBlock(type);
     send("content_block_delta", {
@@ -99,7 +123,9 @@ export function anthropicSink(res: any, modelId: string) {
     });
   };
   return {
-    get opened() { return opened; },
+    whenOpened: out.whenOpened,
+    get opened() { return out.opened; },
+    attach: out.attach,
     delta(kind: string, text: string) {
       if (!open()) return;
       if (kind === "reasoning") { sentReasoning += text; emit("thinking", text); }
@@ -118,12 +144,12 @@ export function anthropicSink(res: any, modelId: string) {
         usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens },
       });
       send("message_stop", { type: "message_stop" });
-      try { res.end(); } catch {}
+      return out.flush();
     },
     fail(message: string) {
       if (!open()) return;
       send("error", { type: "error", error: { type: "api_error", message } });
-      try { res.end(); } catch {}
+      return out.flush();
     },
   };
 }
