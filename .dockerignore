@@ -1,0 +1,7 @@
+node_modules
+oc-workspace
+api-keys.json
+.git
+.gitignore
+*.log
+.DS_Store
