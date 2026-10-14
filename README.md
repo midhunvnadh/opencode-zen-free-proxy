@@ -100,11 +100,40 @@ reports the backend URL and the model count.
 bun install
 bun start          # http://localhost:8790 by default
 bun run typecheck
+bun run build      # one-file bundle -> dist/server.js (Docker adds --compile)
 ```
 
 Bun runs the TypeScript sources directly, so there is no build step and no Node
 install. An `opencode` binary on `PATH` is used as the backend, otherwise set
 `OC_BIN`.
+
+## Source layout
+
+| File | Role |
+| ---- | ---- |
+| `src/server.ts` | entry point: `Bun.serve`, signals, boot |
+| `src/app.ts` | routes, request logging, error handling |
+| `src/middleware.ts` | body parsing, dialect selection, model resolution |
+| `src/dialects.ts` | `openai` / `anthropic`: the things that differ |
+| `src/stream.ts` | frame buffer, the two SSE sinks, the streaming relay |
+| `src/protocols.ts` | both wire formats: prompts in, answers and errors out |
+| `src/opencode.ts` | the backend: spawn, requests, models, sessions, events |
+| `src/lib.ts` | primitives: errors, ids, time, stream pump, binary lookup |
+| `src/config.ts` | environment |
+
+Imports only ever point down the table; nothing reaches back up for something it
+did not need. The two completion routes are a single handler behind a `Dialect`,
+so a third provider is one entry in `dialects.ts` rather than a new route.
+
+`hono/logger` prints a line per request:
+
+```
+<-- POST /v1/messages
+--> POST /v1/messages 200 2s
+```
+
+On a streaming request the second line fires when the stream is committed, so its
+duration is time-to-first-token rather than the length of the whole answer.
 
 ## Env
 
@@ -137,9 +166,11 @@ Auth is optional: any `Authorization: Bearer …` / `x-api-key` is accepted and
 
 ## Container images
 
-`Dockerfile` builds the sources on `oven/bun:1-slim` and bundles `opencode-cli`,
-the backend the proxy spawns. `bun.lock` pins the dependency versions the image
-installs. Compose is the easy path; plain Docker works too:
+The image is alpine plus two files: the `opencode-cli` binary the proxy spawns,
+and the proxy itself compiled into a single self-contained executable. Two
+builder stages do the packaging and are then discarded, so the runtime carries no
+bun, no glibc and no `node_modules`. `bun.lock` pins the dependency versions the
+image installs. Compose is the easy path; plain Docker works too:
 
 ```bash
 docker build -t oc-proxy .
@@ -158,17 +189,63 @@ needed for the proxy to work.
 The container runs as an unprivileged `app` user (uid 1001). Bind mounts from
 the host must be writable by that uid; the named volumes above already are.
 
-### Adding opencode-cli
+### Size
 
-1. `ENV BUN_INSTALL=/usr/local/bun` — keeps the global install out of `/root`,
-   so the unprivileged `app` user can execute it.
-2. `bun install -g --trust @opencode/cli@2` — pulls the CLI plus the native
-   binary for the build platform; `--trust` allows its postinstall script. Bump
-   the version here; the image is ~1 GB because that install carries one binary
-   per platform.
-3. `ENV OC_BIN=/usr/local/bin/opencode` — the proxy spawns this path directly
-   instead of searching `PATH`.
-4. `git` is installed because opencode shells out to it for repo and snapshot
-   work.
+Measured on linux/arm64:
+
+| Layer | Debian image | This one |
+| ----- | ------------ | -------- |
+| base | `oven/bun:1-slim`, 278 MB | `alpine:3.20`, 9.5 MB |
+| bun runtime | 88 MB | – (embedded in the proxy) |
+| `opencode-cli` | 418 MB | 206 MB |
+| git | 109 MB | 17.5 MB (with `libstdc++`) |
+| proxy | 4 MB (`node_modules` + `src`) | 83 MB (one executable) |
+| **image** | **1.04 GB** | **465 MB** |
+
+The proxy executable is larger than the sources it replaces because `--compile`
+embeds the bun runtime in it — the separate 88 MB install is gone either way.
+The opencode binary itself (~206 MB) is the floor unless you stop shipping it.
+
+### Platforms
+
+linux/amd64 and linux/arm64, both musl. Both are built and tested. That pair is a
+ceiling rather than a choice: `oven/bun:1-alpine` publishes only those two, and
+`@opencode/cli` ships binaries only for linux `x64` and `arm64` (`x64-baseline`
+covers CPUs without AVX2, and the postinstall picks it automatically). Anything
+else fails at the first `FROM`:
+
+```
+no match for platform in manifest: not found
+```
+
+`compose.yaml` builds for whatever architecture it runs on. To publish one
+multi-arch tag, build each platform and merge the manifests with buildx:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t youruser/oc-proxy .
+```
+
+### Why the image is small
+
+`opencode-cli` is the bulk of it, and its install is the part worth knowing
+about:
+
+- The runtime is alpine, so the `opencode` binary is the musl build, and the
+  builder stage exists only to lift that one file out of the install.
+- `@opencode/cli`'s postinstall hard-links the platform's native binary into
+  `@opencode/cli/bin`, but the package manager also installs every sibling
+  package matching `os`/`cpu` — on linux/arm64 that is a second ~200 MB musl
+  build that a glibc image could never run. They are dropped after the install;
+  the hard link keeps the real binary's inode alive on its own.
+- The proxy is built with `bun build --compile`, so the final image needs no bun
+  install and no `node_modules`.
+
+Bumping opencode is the version in the builder stage:
+
+```dockerfile
+RUN bun install -g --trust @opencode/cli@2 \
+ && rm -rf "$BUN_INSTALL/install/cache" "$BUN_INSTALL/install/global/node_modules/@opencode/cli-"* \
+ && opencode --version
+```
 
 Verify with `docker run --rm oc-proxy opencode --version`.

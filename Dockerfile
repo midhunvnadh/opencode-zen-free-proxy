@@ -1,21 +1,47 @@
-# Bun runs the TypeScript sources directly, so dependencies are the only thing
-# that needs to be staged separately from the app.
-FROM oven/bun:1-slim AS deps
+# The runtime image is alpine + opencode + one self-contained executable. Nothing
+# else: no bun, no glibc, no node_modules, no TypeScript sources.
+#
+# Two builder stages do the packaging work and are then thrown away. Splitting
+# them lets the final stage copy plain files instead of inheriting either
+# toolchain - bun is only needed to compile, and to install opencode.
+FROM oven/bun:1-alpine AS build
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
+COPY src ./src
 
-FROM oven/bun:1-slim
+# --compile embeds the bun runtime, so the result is one file that runs on its own.
+RUN bun build src/server.ts --target=bun --compile --minify --outfile /out/proxy
 
-# opencode-cli is the backend the proxy spawns (`opencode serve`). It ships a
-# native binary per platform as optional dependencies, and its postinstall must
-# be allowed to run, hence --trust. BUN_INSTALL keeps the global install out of
-# /root so the unprivileged runtime user can execute it.
+# opencode-cli is the backend the proxy spawns (`opencode serve`) and is the bulk of
+# the image. It is installed here only to lift its native binary out: on alpine the
+# postinstall picks the musl build, which is what a musl runtime can execute. Its
+# package manager also installs every sibling matching os/cpu, so drop those - the
+# hard-linked launcher in @opencode/cli/bin keeps its inode alive on its own.
+FROM oven/bun:1-alpine AS opencode
 ENV BUN_INSTALL=/usr/local/bun
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git \
- && rm -rf /var/lib/apt/lists/*
-RUN bun install -g --trust @opencode/cli@2 && rm -rf "$BUN_INSTALL/install/cache"
+RUN bun install -g --trust @opencode/cli@2 \
+ && rm -rf "$BUN_INSTALL/install/cache" "$BUN_INSTALL/install/global/node_modules/@opencode/cli-"* \
+ && opencode --version
+
+FROM alpine:3.20
+
+# git is what opencode shells out to for repo and snapshot work. libstdc++ is a
+# dynamic dependency of the bun-compiled binaries above.
+RUN apk add --no-cache git libstdc++ \
+ && adduser --disabled-password --uid 1001 --home /home/app app
+
+WORKDIR /app
+
+# Mount points for the documented volumes. Creating them here means a fresh named
+# volume inherits this ownership instead of Docker's root-owned default. They are
+# made before the copies, and ownership is set by COPY --chown, because a later
+# chown over a large copied file would copy it up into an extra layer.
+RUN mkdir -p /home/app/.local/share/opencode /app/oc-workspace /keys \
+ && chown -R app:app /home/app/.local /app/oc-workspace /keys
+
+COPY --chown=app:app --from=opencode /usr/local/bun/install/global/node_modules/@opencode/cli/bin/opencode.exe /usr/local/bin/opencode
+COPY --chown=app:app --from=build /out/proxy /app/proxy
 
 # OC_BIN is an absolute path so the proxy never has to search PATH.
 # OC_WORKDIR / KEYS_FILE are written at runtime, so they must stay writable.
@@ -25,27 +51,12 @@ ENV OC_BIN=/usr/local/bin/opencode \
     OC_WORKDIR=/app/oc-workspace \
     KEYS_FILE=/app/api-keys.json
 
-RUN useradd --create-home --home-dir /home/app --shell /usr/sbin/nologin app
-
-# /app itself is created by root, and the runtime user writes api-keys.json and
-# oc-workspace into it.
-WORKDIR /app
-RUN chown app:app /app
-COPY --from=deps --chown=app:app /app/node_modules ./node_modules
-COPY --chown=app:app package.json bun.lock tsconfig.json ./
-COPY --chown=app:app src ./src
-
-# Mount points for the documented volumes. Creating them here means a fresh
-# named volume inherits this ownership instead of Docker's root-owned default.
-RUN mkdir -p /home/app/.local/share/opencode /app/oc-workspace /keys \
- && chown -R app:app /home/app/.local /app/oc-workspace /keys
-
 USER app
 EXPOSE 8790
 
 # The opencode backend can take a while to come up on first request, hence the
-# generous start period.
+# generous start period. busybox wget covers the probe; the image has no bun.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-  CMD bun -e "fetch('http://127.0.0.1:'+(process.env.PROXY_PORT||8790)+'/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+  CMD wget -q -O /dev/null "http://127.0.0.1:${PROXY_PORT:-8790}/health" || exit 1
 
-CMD ["bun", "run", "src/server.ts"]
+CMD ["/app/proxy"]
