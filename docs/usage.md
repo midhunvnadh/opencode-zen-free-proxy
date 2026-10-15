@@ -9,9 +9,10 @@
 - An OpenAI-compatible client, or just curl. Nothing to install for the curl
   path.
 - **Check the client against [compatibility.md](compatibility.md) first.** Any
-  OpenAI-compatible client connects, but one that relies on tool calling or
-  images will not work: the API is text-only, single-choice, and ignores
-  sampling parameters.
+  OpenAI-compatible client connects. Tool calling works, on both routes — see
+  [tool-calling.md](tool-calling.md) for how it is reached and what it costs.
+  Images do not: the API is text-only, single-choice, and ignores sampling
+  parameters.
 
 You do not need the API key — any value is accepted. To paste the real one
 instead, `docker compose exec proxy cat /keys/api-keys.json`.
@@ -105,3 +106,42 @@ curl -s http://localhost:8790/v1/chat/completions \
   -H 'x-oc-session: my-chat' \
   -d '{"model":"big-pickle","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+## Tools
+
+Send `tools` and the model is given them. When it wants one, the reply carries
+`finish_reason: "tool_calls"` instead of an answer; run the function, send the
+result back, and the next reply is the answer to your original question.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8790/v1", api_key="oc-…")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    },
+}]
+
+messages = [{"role": "user", "content": "weather in Paris?"}]
+res = client.chat.completions.create(model="big-pickle", messages=messages, tools=tools)
+while res.choices[0].finish_reason == "tool_calls":
+    call = res.choices[0].message.tool_calls[0]
+    print("running", call.function.name, call.function.arguments)
+    messages += [
+        res.choices[0].message.model_dump(exclude_none=True),
+        {"role": "tool", "tool_call_id": call.id, "content": look_up_weather(**json.loads(call.function.arguments))},
+    ]
+    res = client.chat.completions.create(model="big-pickle", messages=messages, tools=tools)
+
+print(res.choices[0].message.content)
+```
+
+The Anthropic route takes `tools` in its own shape and answers with a
+`tool_use` block; send the result back in a `tool_result` block. Both are in
+[tool-calling.md](tool-calling.md), along with what this path costs: the tools
+are described to the model rather than given to it, so it sometimes answers in
+prose instead of calling.

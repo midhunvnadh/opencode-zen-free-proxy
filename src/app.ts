@@ -4,7 +4,7 @@ import { anthropic, openai } from "./dialects.ts";
 import { HttpError, nowSeconds } from "./lib.ts";
 import { dialect, resolveModel, withBody, type Env } from "./middleware.ts";
 import { askModel, listModels, modelCount, ocBase } from "./opencode.ts";
-import { extractMessage, openaiFailure, sendFailure } from "./protocols.ts";
+import { extractAnswer, openaiFailure, sendFailure, toolInstructions, toolResultPrompt } from "./protocols.ts";
 import { relay } from "./stream.ts";
 
 /** The conversation key: an explicit header wins, else the user field each provider
@@ -20,16 +20,31 @@ const completion: Handler<Env> = async (c) => {
   const d = c.get("dialect");
   const body = c.get("body");
   const modelId = c.get("modelId");
-  const { system, transcript, lastUserText } = d.prompt(body);
-  if (!lastUserText) throw new HttpError(400, "No user message in request", "invalid_request_error");
+  const { system, transcript, lastUserText, tools } = d.prompt(body);
+  // A request that only carries a tool result is the next step of a turn already in
+  // flight, not an empty request.
+  if (!lastUserText && !tools.results.length) throw new HttpError(400, "No user message in request", "invalid_request_error");
 
   const ask = (onSession?: (sid: string) => void) =>
-    askModel({ key: sessionKey(c, body), modelId, system, transcript, lastUserText, onSession });
+    askModel({
+      key: sessionKey(c, body),
+      modelId,
+      system,
+      directives: toolInstructions(tools.declared),
+      transcript,
+      lastUserText,
+      toolNames: tools.declared.map((t) => t.name),
+      toolResults: toolResultPrompt(tools.results),
+      onSession,
+    });
 
-  if (body.stream) return relay(c, d.sink(modelId), ask, d.fail);
+  // A model announces a tool call in the same text as its answer, so a request that
+  // offers tools cannot stream as it goes: the client would be handed both the call and
+  // the prose around it. It waits and is answered in one piece.
+  if (body.stream) return relay(c, d.sink(modelId), ask, d.fail, tools.declared.length === 0);
 
-  const answer = extractMessage(await ask());
-  if (!answer.text && !answer.reasoning) throw new HttpError(502, "empty response from opencode");
+  const answer = extractAnswer(await ask());
+  if (!answer.text && !answer.reasoning && !answer.toolCall) throw new HttpError(502, "empty response from opencode");
   return c.json(d.response(modelId, answer));
 };
 

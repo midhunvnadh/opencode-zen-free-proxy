@@ -2,7 +2,7 @@ import { streamSSE, type SSEStreamingApi } from "hono/streaming";
 import type { Context } from "hono";
 import { describeError, nowSeconds, rid } from "./lib.ts";
 import { connectEvents } from "./opencode.ts";
-import { anthropicStopReason, extractMessage, openaiFinish, openaiUsage, sendFailure, type Answer, type Failure } from "./protocols.ts";
+import { anthropicStopReason, extractAnswer, openaiFinish, openaiToolCall, openaiUsage, sendFailure, toolArguments, type Answer, type Failure, type ToolCall } from "./protocols.ts";
 
 /** The two streaming sinks and the relay that connects them to a request. A sink
  *  writes provider-shaped SSE frames into a buffer and only reaches the client once
@@ -71,6 +71,7 @@ export const openaiSink = (modelId: string): Sink => {
   const created = nowSeconds();
   const out = buffer();
   const seen = tail();
+  let sentTool = false;
   const chunk = (delta: object, finish?: string, usage?: object) =>
     out.send(JSON.stringify({
       id, object: "chat.completion.chunk", created, model: modelId,
@@ -78,6 +79,14 @@ export const openaiSink = (modelId: string): Sink => {
       ...(usage ? { usage } : {}),
     }));
   const open = () => out.opened || chunk({ role: "assistant" });
+  // A tool call is a single frame: the client needs the name and the whole argument
+  // string together to run it.
+  const tool = (call: ToolCall) => {
+    if (sentTool) return;
+    sentTool = true;
+    if (!open()) return;
+    chunk({ tool_calls: [{ index: 0, ...openaiToolCall(call) }] });
+  };
 
   return {
     whenOpened: out.whenOpened,
@@ -93,7 +102,8 @@ export const openaiSink = (modelId: string): Sink => {
       const text = seen.unseen(answer.text);
       if (reasoning) chunk({ reasoning_content: reasoning });
       if (text) chunk({ content: text });
-      chunk({}, openaiFinish(answer.finish), openaiUsage(answer));
+      if (answer.toolCall) tool(answer.toolCall);
+      chunk({}, openaiFinish(answer), openaiUsage(answer));
       out.send("[DONE]");
       return out.flush();
     },
@@ -111,16 +121,21 @@ export const anthropicSink = (modelId: string): Sink => {
   const out = buffer();
   const seen = tail();
   let block: string | null = null;
+  let tool: ToolCall | null = null;
   let index = -1;
   const send = (event: string, data: object) => out.send(JSON.stringify(data), event);
-  const openBlock = (type: string) => {
-    if (block === type) return;
+  const openBlock = (type: string, call?: ToolCall) => {
+    if (block === type && (!call || tool?.id === call.id)) return;
     if (block) send("content_block_stop", { type: "content_block_stop", index });
     index += 1;
     block = type;
+    tool = call ?? null;
     send("content_block_start", {
       type: "content_block_start", index,
-      content_block: type === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" },
+      content_block:
+        type === "thinking" ? { type: "thinking", thinking: "" }
+        : type === "tool" ? { type: "tool_use", id: call?.id, name: call?.name, input: {} }
+        : { type: "text", text: "" },
     });
   };
   const open = () => out.opened || send("message_start", {
@@ -135,6 +150,15 @@ export const anthropicSink = (modelId: string): Sink => {
     send("content_block_delta", {
       type: "content_block_delta", index,
       delta: type === "thinking" ? { type: "thinking_delta", thinking: text } : { type: "text_delta", text },
+    });
+  };
+  // A tool_use block carries its arguments as one input_json_delta holding the whole
+  // object, which is what the client needs to run the call.
+  const emitTool = (call: ToolCall) => {
+    openBlock("tool", call);
+    send("content_block_delta", {
+      type: "content_block_delta", index,
+      delta: { type: "input_json_delta", partial_json: toolArguments(call) },
     });
   };
 
@@ -152,10 +176,11 @@ export const anthropicSink = (modelId: string): Sink => {
       const text = seen.unseen(answer.text);
       if (reasoning) emit("thinking", reasoning);
       if (text) emit("text", text);
+      if (answer.toolCall) emitTool(answer.toolCall);
       if (block) send("content_block_stop", { type: "content_block_stop", index });
       send("message_delta", {
         type: "message_delta",
-        delta: { stop_reason: anthropicStopReason(answer.finish) },
+        delta: { stop_reason: anthropicStopReason(answer) },
         usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
       });
       send("message_stop", { type: "message_stop" });
@@ -172,34 +197,31 @@ export const anthropicSink = (modelId: string): Sink => {
 /** Answers one streaming request. A sink reaches the client only once it is attached to
  *  the response stream, so the relay holds the response back until the first token
  *  arrives. A relay that fails before that is still reported as a normal JSON error
- *  with a real status code instead of an SSE frame on a 200. */
+ *  with a real status code instead of an SSE frame on a 200.
+ *
+ *  `live` is false for a request whose answer may turn out to be a tool call: there is
+ *  nothing to stream until the turn ends, so no event tail is opened and the whole
+ *  answer goes out at once. */
 export async function relay(
   c: Context,
   sink: Sink,
-  run: (onSession: (sid: string) => void) => Promise<any>,
-  fail: (e: unknown) => Failure
+  run: (onSession?: (sid: string) => void) => Promise<any>,
+  fail: (e: unknown) => Failure,
+  live = true
 ) {
+  if (!live) return once(c, sink, await settle(run()), fail);
+
   const watch = { sid: null as string | null, sink };
   const conn = connectEvents(watch);
   const close = () => conn.close();
   c.req.raw.signal.addEventListener("abort", close);
 
-  const settled: Promise<{ result?: any; error?: any }> = run((sid) => { watch.sid = sid; }).then(
-    (result) => ({ result }),
-    (error) => ({ error })
-  );
+  const settled = settle(run((sid) => { watch.sid = sid; }));
   const started = await Promise.race([sink.whenOpened.then(() => true), settled.then(() => false)]);
 
   if (!started) {
     close();
-    const done = await settled;
-    if (done.error) return sendFailure(c, fail, done.error);
-    const answer = extractMessage(done.result);
-    if (!answer.text && !answer.reasoning) return sendFailure(c, fail, new Error("empty response from opencode"));
-    return commit(c, async (sse) => {
-      sink.attach(sse);
-      await sink.finish(answer);
-    });
+    return once(c, sink, await settled, fail);
   }
 
   return commit(c, async (sse) => {
@@ -208,10 +230,27 @@ export async function relay(
       sink.attach(sse);
       const done = await settled;
       if (done.error) await sink.fail(describeError(done.error).message);
-      else await sink.finish(extractMessage(done.result));
+      else await sink.finish(extractAnswer(done.result));
     } finally {
       close();
     }
+  });
+}
+
+const settle = (run: Promise<any>): Promise<{ result?: any; error?: any }> =>
+  run.then((result) => ({ result }), (error) => ({ error }));
+
+/** The answer, given as one piece: what a sink already streamed is finished here, and a
+ *  turn that said nothing at all is a failure rather than an empty 200. */
+async function once(c: Context, sink: Sink, done: { result?: any; error?: any }, fail: (e: unknown) => Failure) {
+  if (done.error) return sendFailure(c, fail, done.error);
+  const answer = extractAnswer(done.result);
+  if (!answer.text && !answer.reasoning && !answer.toolCall) {
+    return sendFailure(c, fail, new Error("empty response from opencode"));
+  }
+  return commit(c, async (sse) => {
+    sink.attach(sse);
+    await sink.finish(answer);
   });
 }
 

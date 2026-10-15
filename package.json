@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:live": "LIVE=1 vitest run test/live.test.ts",
     "check": "bun run typecheck && bun run test"
   },
   "dependencies": {

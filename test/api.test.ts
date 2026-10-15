@@ -236,6 +236,162 @@ describe("conversation keys", () => {
   });
 });
 
+describe("tool calling", () => {
+  const weather = [
+    {
+      type: "function",
+      function: { name: "get_weather", description: "current weather", parameters: { type: "object", properties: { city: { type: "string" } } } },
+    },
+  ];
+  /** What the model answers with when it wants the caller to run something. */
+  const calling = (text = '```tool_call\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n```') =>
+    (backend.answer = { content: [{ type: "text", text }], tokens: { input: 9, output: 3 }, finish: "stop" });
+
+  it("tells the backend which functions the client offered", async () => {
+    await post("/v1/chat/completions", ask({ tools: weather }));
+    expect(backend.calls[0].toolNames).toEqual(["get_weather"]);
+    expect(backend.calls[0].toolResults).toBe("");
+  });
+
+  it("offers no tools when the request declares none", async () => {
+    await post("/v1/chat/completions", ask());
+    expect(backend.calls[0].toolNames).toEqual([]);
+    expect(backend.calls[0].directives).toBe("");
+  });
+
+  it("describes the functions to the model in its own words, apart from the client's system prompt", async () => {
+    await post("/v1/chat/completions", {
+      model: "big-pickle",
+      tools: weather,
+      messages: [{ role: "system", content: "Be brief." }, { role: "user", content: "hello" }],
+    });
+    // The client's system prompt is passed through as it was written...
+    expect(backend.calls[0].system).toBe("Be brief.");
+    // ...and how to call a function travels beside it, not inside it.
+    expect(backend.calls[0].directives).toContain("get_weather: current weather");
+    expect(backend.calls[0].directives).toContain('"city"');
+  });
+
+  it("answers with an OpenAI tool call", async () => {
+    calling();
+    const res = await post("/v1/chat/completions", ask({ tools: weather }));
+    expect(res.status).toBe(200);
+    const choice = (await json(res)).choices[0];
+    expect(choice.finish_reason).toBe("tool_calls");
+    // The block is the proxy's, so the answer beside it is empty.
+    expect(choice.message.content).toBeNull();
+    expect(choice.message.tool_calls[0]).toMatchObject({ id: expect.stringMatching(/^call_/), type: "function", function: { name: "get_weather" } });
+    expect(JSON.parse(choice.message.tool_calls[0].function.arguments)).toEqual({ city: "Paris" });
+  });
+
+  it("keeps the prose the model wrote around the call", async () => {
+    calling("Let me check.\n```tool_call\n{\"name\": \"get_weather\", \"arguments\": {}}\n```");
+    const res = await post("/v1/chat/completions", ask({ tools: weather }));
+    expect((await json(res)).choices[0].message.content).toBe("Let me check.");
+  });
+
+  it("answers with prose when the model used no block", async () => {
+    calling("I could not check the weather.");
+    const choice = (await json(await post("/v1/chat/completions", ask({ tools: weather })))).choices[0];
+    expect(choice.finish_reason).toBe("stop");
+    expect(choice.message.content).toBe("I could not check the weather.");
+    expect(choice.message.tool_calls).toBeUndefined();
+  });
+
+  it("streams a tool call as one answer rather than leaking the block", async () => {
+    calling();
+    const res = await post("/v1/chat/completions", ask({ tools: weather, stream: true }));
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const { raw, frames } = await sse(res);
+    expect(raw).not.toContain("tool_call\n");
+    const call = frames.flatMap((f) => f.data?.choices?.[0]?.delta?.tool_calls ?? [])[0];
+    expect(call).toMatchObject({ type: "function", function: { name: "get_weather" } });
+    expect(frames.filter((f) => f.data?.choices?.[0]?.finish_reason).at(-1)?.data.choices[0].finish_reason).toBe("tool_calls");
+    expect(frames.at(-1)?.data).toBe("[DONE]");
+  });
+
+  it("still streams live deltas when no tools were offered", async () => {
+    backend.deltas = [{ kind: "text", text: "hi " }, { kind: "text", text: "there" }];
+    const res = await post("/v1/chat/completions", ask({ stream: true }));
+    const { frames } = await sse(res);
+    expect(frames.flatMap((f) => f.data?.choices?.[0]?.delta?.content ?? [])).toEqual(["hi ", "there"]);
+  });
+
+  it("answers with an Anthropic tool_use block", async () => {
+    calling();
+    const res = await post("/v1/messages", ask({ tools: [{ name: "get_weather", input_schema: {} }] }));
+    const body = await json(res);
+    expect(body.stop_reason).toBe("tool_use");
+    expect(body.content).toEqual([
+      { type: "tool_use", id: expect.stringMatching(/^call_/), name: "get_weather", input: { city: "Paris" } },
+    ]);
+  });
+
+  it("streams an Anthropic tool_use block", async () => {
+    calling();
+    const res = await post("/v1/messages", ask({ tools: [{ name: "get_weather" }], stream: true }));
+    const { frames } = await sse(res);
+    const start = frames.find((f) => f.event === "content_block_start");
+    expect(start?.data.content_block).toEqual({ type: "tool_use", id: expect.any(String), name: "get_weather", input: {} });
+    const delta = frames.find((f) => f.event === "content_block_delta");
+    expect(delta?.data.delta).toEqual({ type: "input_json_delta", partial_json: '{"city":"Paris"}' });
+    expect(frames.at(-2)?.data.delta.stop_reason).toBe("tool_use");
+    expect(frames.at(-1)?.event).toBe("message_stop");
+  });
+
+  it("forwards the result the client executed, with no new user text", async () => {
+    const res = await post("/v1/chat/completions", {
+      model: "big-pickle",
+      messages: [
+        { role: "user", content: "weather in Paris?" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_a", function: { name: "get_weather", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_a", content: "18C and raining" },
+      ],
+      tools: weather,
+    });
+    // A result with nothing new to say is the next step of a turn in flight.
+    expect(res.status).toBe(200);
+    expect(backend.calls[0].toolNames).toEqual(["get_weather"]);
+    expect(backend.calls[0].toolResults).toContain("`get_weather` (call_a)");
+    expect(backend.calls[0].toolResults).toContain("18C and raining");
+  });
+
+  it("forwards an Anthropic tool_result block", async () => {
+    const res = await post("/v1/messages", {
+      model: "big-pickle",
+      messages: [
+        { role: "user", content: "weather in Paris?" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "get_weather", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "18C" }] },
+      ],
+      tools: [{ name: "get_weather" }],
+    });
+    expect(res.status).toBe(200);
+    expect(backend.calls[0].toolResults).toContain("18C");
+    // The question was asked before the result and is not asked again.
+    expect(backend.calls[0].lastUserText).toBe("");
+  });
+
+  it("asks a question that came after the result", async () => {
+    await post("/v1/chat/completions", {
+      model: "big-pickle",
+      messages: [
+        { role: "user", content: "weather in Paris?" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_a", function: { name: "get_weather", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_a", content: "18C" },
+        { role: "user", content: "and in Rome?" },
+      ],
+      tools: weather,
+    });
+    expect(backend.calls[0].lastUserText).toBe("and in Rome?");
+  });
+
+  it("still rejects a request with no user turn and no result", async () => {
+    const res = await post("/v1/chat/completions", { model: "big-pickle", messages: [{ role: "system", content: "only system" }] });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("upstream failures", () => {
   it("keeps the status the backend reported", async () => {
     backend.fail = { status: 429, message: "rate limited" };

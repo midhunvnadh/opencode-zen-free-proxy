@@ -42,6 +42,22 @@ A `Dialect` is only the bundle — prompt in, response out, SSE sink, error
 format. `protocols.ts` and `stream.ts` implement those, so a new provider is
 one entry in `dialects.ts` plus its two wire formats.
 
+## Tools
+
+A request that carries `tools` takes one extra step in each direction, and each
+step belongs where it is:
+
+- `protocols.ts` reads both dialects' tool shapes into one `Tools` — the
+  functions offered and the results coming back — writes the results as prompt
+  text, describes the functions for the model, and lifts a call back out of the
+  answer.
+- `opencode.ts` creates the session with every tool set to ask, waits for the
+  turn or for a request to run a tool together, and refuses the ones the caller
+  never offered. The details are in [tool-calling.md](tool-calling.md).
+- `stream.ts` carries a call as a `tool_calls` delta or a `tool_use` block, and
+  a request that offers tools does not stream live — there is nothing to stream
+  until the turn ends and the answer is known to be prose or a call.
+
 ## Errors
 
 Failures are thrown as `HttpError` from `lib.ts` and rendered by `protocols.ts`

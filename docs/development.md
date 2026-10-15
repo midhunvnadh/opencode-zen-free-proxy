@@ -38,16 +38,40 @@ once; `bunx vitest` watches.
 | File | Covers |
 | ---- | ------ |
 | `test/lib.test.ts` | error normalisation, ids, basic auth, the stream pump |
-| `test/protocols.test.ts` | prompt flattening, answer extraction, both response and error shapes |
+| `test/protocols.test.ts` | prompt flattening, the tool exchange, both response and error shapes |
+| `test/opencode.test.ts` | the backend against a scripted HTTP server: sessions, turns, tool interception |
 | `test/api.test.ts` | every route end to end against a fake backend, streaming included |
+| `test/live.test.ts` | the real app against a real `opencode serve` — skipped unless `LIVE=1` |
 
 `test/api.test.ts` drives the real `app.ts`, middleware, dialects, sinks and
 relay, so routing and both SSE sequences are covered without a live model. The
 fake backend can be scripted to stream deltas, fail before streaming begins, or
 fail after — which is how the two branches of the relay are covered.
 
-Everything the tests cover is deterministic; nothing needs the network. That is
-also why CI does not need a live `opencode` server to run them.
+`test/opencode.test.ts` covers what the others cannot: `api.test.ts` replaces
+the whole backend module, so the session lifecycle and the loop that stops a
+tool before it runs would otherwise go untested.
+
+Everything those four cover is deterministic and needs no network, which is why
+CI does not need a live `opencode` server.
+
+## Tests against a real model
+
+`test/live.test.ts` is the other half: the real app, a real backend, a real
+model. It is skipped unless `LIVE=1`, so it never makes `bun run check` slow or
+flaky. To run it, start a server and point at it:
+
+```bash
+opencode serve --port 0 --hostname 127.0.0.1     # prints the port it took
+OC_SERVER=http://127.0.0.1:<port> bun run test:live
+```
+
+Add `OC_USERNAME` / `OC_PASSWORD` if the server wants basic auth. Leave
+`OC_SERVER` unset and the proxy starts and stops a server of its own.
+
+A few of these ask the model for a tool call, and the model — not the proxy —
+decides whether to make one, so they ask again rather than assert on a coin
+flip. What they hold the proxy to is the exchange.
 
 ## Continuous integration
 
