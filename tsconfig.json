@@ -1,10 +1,10 @@
 {
   "compilerOptions": {
     "target": "esnext",
-    "module": "nodenext",
-    "moduleResolution": "nodenext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
     "lib": ["esnext"],
-    "types": ["node"],
+    "types": ["bun"],
     "strict": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
@@ -12,5 +12,5 @@
     "erasableSyntaxOnly": true,
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src", "test", "vitest.config.ts"]
 }

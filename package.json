@@ -4,21 +4,25 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/server.ts",
-    "dev": "node --watch src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "start": "bun src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "build": "bun build src/server.ts --target=bun --minify --outfile dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "LIVE=1 vitest run test/live.test.ts",
+    "check": "bun run typecheck && bun run test"
   },
   "dependencies": {
-    "@hono/node-server": "^2.1.5",
-    "axios": "^1.20.0",
     "hono": "^4.13.13"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
-    "typescript": "^7.0.2"
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
   },
   "license": "MIT",
   "engines": {
-    "node": ">=24"
+    "bun": ">=1.2"
   }
 }

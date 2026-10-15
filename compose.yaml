@@ -1,0 +1,24 @@
+# Getting started:  docker compose up -d --build   (then read the API key it logs)
+#
+# PORT changes the port on your machine only; the container always listens on
+# 8790. Everything else is configured with the env vars documented in
+# docs/configuration.md.
+services:
+  proxy:
+    build: .
+    image: oc-proxy
+    ports:
+      - "${PORT:-8790}:8790"
+    environment:
+      # Keep the generated api-keys.json in a volume instead of the image layer.
+      KEYS_FILE: /keys/api-keys.json
+    volumes:
+      # Generated API keys for clients of this proxy. The only thing worth
+      # keeping: opencode's state and the agent workspace live inside the
+      # container and start empty on every recreate, and conversations are
+      # recovered from the transcript the client sends.
+      - keys:/keys
+    restart: unless-stopped
+
+volumes:
+  keys:
