@@ -21,6 +21,7 @@ const completion: Handler<Env> = async (c) => {
   const body = c.get("body");
   const modelId = c.get("modelId");
   const { system, transcript, lastUserText, tools } = d.prompt(body);
+  const names = tools.declared.map((t) => t.name);
   // A request that only carries a tool result is the next step of a turn already in
   // flight, not an empty request.
   if (!lastUserText && !tools.results.length) throw new HttpError(400, "No user message in request", "invalid_request_error");
@@ -33,7 +34,7 @@ const completion: Handler<Env> = async (c) => {
       directives: toolInstructions(tools.declared),
       transcript,
       lastUserText,
-      toolNames: tools.declared.map((t) => t.name),
+      toolNames: names,
       toolResults: toolResultPrompt(tools.results),
       onSession,
     });
@@ -41,9 +42,9 @@ const completion: Handler<Env> = async (c) => {
   // A model announces a tool call in the same text as its answer, so a request that
   // offers tools cannot stream as it goes: the client would be handed both the call and
   // the prose around it. It waits and is answered in one piece.
-  if (body.stream) return relay(c, d.sink(modelId), ask, d.fail, tools.declared.length === 0);
+  if (body.stream) return relay(c, d.sink(modelId), ask, d.fail, names);
 
-  const answer = extractAnswer(await ask());
+  const answer = extractAnswer(await ask(), names);
   if (!answer.text && !answer.reasoning && !answer.toolCall) throw new HttpError(502, "empty response from opencode");
   return c.json(d.response(modelId, answer));
 };

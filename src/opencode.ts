@@ -1,5 +1,6 @@
 import { OC_BIN, OC_PASSWORD, OC_SERVER, OC_USERNAME, OC_WORKDIR, REQUEST_TIMEOUT } from "./config.ts";
 import { HttpError, basicAuth, pump, randomHex, rid, sleep } from "./lib.ts";
+import { announcedName, extractMessage } from "./protocols.ts";
 
 /** Everything the proxy needs to talk to one `opencode serve` backend: spawning or
  *  reusing it, the request plumbing, the model list, the conversations and the event
@@ -135,20 +136,34 @@ async function reject(sid: string, id: string) {
  *  cannot answer without one. */
 const MAX_TOOL_ROUNDS = 2;
 
-/** Prompts a session and returns the assistant message it ended with. A model that
- *  reaches for a tool of its own is stopped where it stands and told the tool is not
- *  available, so it uses the caller's functions instead — see docs/tool-calling.md. */
+/** Points the model at what it can call instead, in the same words it was given the tools
+ *  in. A model that reached for something it does not have tends to answer that it cannot
+ *  do the job at all, and naming the alternative is what keeps it going. */
+const pointElsewhere = (name: string, names: string[]) =>
+  `The \`${name}\` tool is not available in this environment. To do that, call one of the caller's functions — ${names.join(", ")} — with the tool_call block described above. If none of them will do, answer without it.`;
+
+/** Prompts a session and returns the assistant message it ended with. Reaching for
+ *  something the caller does not have costs a round and is pointed elsewhere, whether it
+ *  was opencode's own tool or a caller's function the client never declared — see
+ *  docs/tool-calling.md. */
 async function runPrompt(sid: string, text: string, system: string, names: string[]) {
   const intercept = names.length > 0;
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-    const pr = await request("POST", `/api/session/${sid}/prompt`, { text: system ? `System: ${system}\\n\\n${text}` : text });
+    const pr = await request("POST", `/api/session/${sid}/prompt`, { text: system ? `System: ${system}\n\n${text}` : text });
     if (pr.status !== 200 && pr.status !== 202) throw upstreamError(pr);
     const asked = await awaitTurn(sid, intercept);
-    if (!asked) return latestAssistant(sid);
-    await reject(sid, asked.id);
-    // A model that was stopped tends to answer that it cannot do the job. Naming what it
-    // can call instead, in the same words it was given the tools, is what keeps it going.
-    text = `The \`${asked.action}\` tool is not available in this environment. To do that, call one of the caller's functions — ${names.join(", ")} — with the tool_call block described above. If none of them will do, answer without it.`;
+    if (asked) {
+      await reject(sid, asked.id);
+      text = pointElsewhere(asked.action, names);
+      continue;
+    }
+    const message = await latestAssistant(sid);
+    // A function the client never declared is not its to run, so the block naming it is
+    // not handed over. The model is told so and answers properly, rather than the
+    // caller's machine being handed a call it never offered.
+    const name = intercept ? announcedName(extractMessage(message).text) : null;
+    if (!name || names.includes(name)) return message;
+    text = pointElsewhere(name, names);
   }
   throw new HttpError(502, "the model kept reaching for tools it does not have");
 }

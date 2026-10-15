@@ -149,19 +149,43 @@ The caller's functions:
 ${list}`;
 }
 
-/** The model announces a call in a fenced block, so the block is lifted out of the answer
- *  and the call handed to the client. Anything the model wrote around it is still its
- *  answer. A block that is not a call is left where it is. */
-export function parseToolCall(text: string): { call?: ToolCall; text: string } {
-  const match = text.match(/```tool_call\s*([\s\S]*?)```/);
-  if (!match) return { text };
+/** The model announces a call in a fenced block. */
+const FENCE = /```tool_call\s*([\s\S]*?)```/;
+/** ...and a turn that ran out of tokens can leave the opener with no closer. */
+const OPEN_FENCE = /```tool_call[\s\S]*$/;
+
+/** What a fenced block asks for, or null when the text holds none or it cannot be read.
+ *  Whether the client offered the function is not decided here. */
+function announced(text: string): { name: string; arguments: Record<string, unknown> } | null {
+  const match = text.match(FENCE);
+  if (!match) return null;
   try {
-    const { name, arguments: args } = JSON.parse(match[1]);
-    if (!name) return { text };
-    return { call: { id: rid("call_"), name, arguments: args ?? {} }, text: text.replace(match[0], "").trim() };
+    const said = JSON.parse(match[1]);
+    return said?.name ? { name: said.name, arguments: said.arguments ?? {} } : null;
   } catch {
-    return { text };
+    return null;
   }
+}
+
+/** The fence is the proxy's own convention, so it is never part of the answer — not when
+ *  it holds a call, not when the model copied the template back, and not when a truncated
+ *  turn left the opener unclosed. Anything the model wrote around it is still its answer. */
+const stripFences = (text: string) =>
+  text.replace(new RegExp(FENCE.source, "g"), "").replace(OPEN_FENCE, "").trim();
+
+/** The function a fenced block asks for, as the model wrote it — whether or not the client
+ *  ever offered it. Deciding what may be handed over is the caller's list to make. */
+export const announcedName = (text: string) => announced(text)?.name ?? null;
+
+/** Lifts the call out of the answer, when the client declared one. A block naming anything
+ *  else is not the caller's to run, so it is dropped rather than handed over — which is
+ *  what keeps a function the client never offered from reaching its own machine. */
+export function parseToolCall(text: string, declared: readonly string[]): { call?: ToolCall; text: string } {
+  const said = announced(text);
+  const left = stripFences(text);
+  return said && declared.includes(said.name)
+    ? { call: { id: rid("call_"), name: said.name, arguments: said.arguments }, text: left }
+    : { text: left };
 }
 
 /** What the client executed, as prompt text: the model asked for these tools, they were
@@ -199,11 +223,11 @@ export function extractMessage(message: any): Answer {
 }
 
 /** The assistant message as an answer, with a tool call lifted out of the text when the
- *  model announced one. */
-export function extractAnswer(message: any): Answer {
+ *  model announced one the client had declared. */
+export function extractAnswer(message: any, declared: readonly string[]): Answer {
   const answer = extractMessage(message);
-  const { call, text } = parseToolCall(answer.text);
-  return call ? { ...answer, text, toolCall: call } : answer;
+  const { call, text } = parseToolCall(answer.text, declared);
+  return { ...answer, text, ...(call ? { toolCall: call } : {}) };
 }
 
 /** A turn that ended by handing a tool over stops for its own reason in both dialects. */
