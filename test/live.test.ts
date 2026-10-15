@@ -161,6 +161,24 @@ describe.skipIf(!LIVE)("live, against a real opencode", () => {
     expect(DONE(raw)).toBe(true);
   }, 300_000);
 
+  it("never hands over a function the client did not declare", async () => {
+    // The exchange above proves a declared tool round-trips. This proves the other half:
+    // naming a function the client never offered must not reach its machine, however
+    // eagerly the model offers it. Measured on a real model this fires on the first try.
+    const res = await post("/v1/chat/completions", {
+      model,
+      messages: [{ role: "user", content: "Use the list_dir tool to list /tmp, then tell me what is there." }],
+      tools: OPENAI_TOOLS,
+    });
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    const choice = body.choices[0];
+    const called = choice.message.tool_calls ?? [];
+    expect(called.map((c: any) => c.function.name)).not.toContain("list_dir");
+    // Whatever it settled on, the block is the proxy's own markup and is not answer text.
+    expect(choice.message.content ?? "").not.toContain("tool_call");
+  }, 300_000);
+
   it("runs the same exchange on the Anthropic route", async () => {
     const first = await json(
       await post("/v1/messages", { model, max_tokens: 2048, messages: [{ role: "user", content: ask(logPath) }], tools: ANTHROPIC_TOOLS })

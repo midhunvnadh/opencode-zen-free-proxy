@@ -21,6 +21,11 @@ const fake = {
   reach: null as null | { name: string; args: Record<string, unknown> },
   /** Whether it keeps reaching on every turn instead of just the first. */
   keepReaching: false,
+  /** A call the model announces in its answer as text, which is a different thing from
+   *  reaching for a tool: no permission is ever asked for it. */
+  fence: null as null | { name: string; args: Record<string, unknown> },
+  /** Whether it keeps announcing one instead of just the first turn. */
+  keepFencing: false,
   answer: "all done" as string,
   prompts: [] as string[],
   created: [] as any[],
@@ -51,6 +56,8 @@ const json = (data: unknown, status = 200) => ({ status, text: async () => JSON.
 beforeEach(async () => {
   fake.reach = null;
   fake.keepReaching = false;
+  fake.fence = null;
+  fake.keepFencing = false;
   fake.answer = "all done";
   fake.prompts = [];
   fake.created = [];
@@ -78,6 +85,12 @@ beforeEach(async () => {
         if (!fake.keepReaching) fake.reach = null;
         permission = { id: "per_1", sessionID: "ses_1", action: name, source: { type: "tool", id: CALL_ID, messageID: "msg_1" } };
         message = { ...assistant(""), content: [{ type: "tool", id: CALL_ID, name, state: { status: "running", input: args } }] };
+      } else if (fake.fence && fake.created.at(-1)?.permissions) {
+        // The model announced a call in its answer instead of reaching for one, so the
+        // turn ends by itself and nothing was ever asked for permission.
+        const { name, args } = fake.fence;
+        if (!fake.keepFencing) fake.fence = null;
+        finished = assistant("```tool_call\n" + JSON.stringify({ name, arguments: args }) + "\n```");
       } else {
         finished = assistant(fake.reach ? "the tool ran here" : fake.answer);
       }
@@ -171,6 +184,39 @@ describe("a session with client tools", () => {
     expect(fake.rejected).toEqual([]);
     expect(fake.prompts).toHaveLength(1);
     expect(message.content[0].text).toBe("the tool ran here");
+  });
+});
+
+describe("a model that announces a function the client never offered", () => {
+  const askWithTools = (key: string) =>
+    askModel({ key, modelId: "big-pickle", system: "", transcript: "", lastUserText: "list /tmp", toolNames: ["read_log"] });
+
+  it("is not handed over, and is pointed at what it can call instead", async () => {
+    fake.fence = { name: "list_dir", args: { path: "/tmp" } };
+    const message = await askWithTools("undeclared");
+    // Nothing ran and nothing was refused: this arrived as answer text, never as a tool
+    // opencode tried to run, so there is no permission to reject.
+    expect(fake.rejected).toEqual([]);
+    // The round a permission would have cost buys the model an answer instead.
+    expect(fake.prompts).toHaveLength(2);
+    expect(fake.prompts[1]).toContain("`list_dir`");
+    expect(fake.prompts[1]).toContain("read_log");
+    expect(message.content[0].text).toBe("all done");
+  });
+
+  it("gives up on a model that keeps announcing one", async () => {
+    fake.fence = { name: "list_dir", args: {} };
+    fake.keepFencing = true;
+    await expect(askWithTools("stubborn-fence")).rejects.toThrow("kept reaching for tools");
+    // Bounded by the same budget a permission costs, not a second one.
+    expect(fake.prompts).toHaveLength(3);
+  });
+
+  it("spends no round on it when the client offered no functions", async () => {
+    fake.fence = { name: "list_dir", args: {} };
+    await askModel({ key: "no-tools", modelId: "big-pickle", system: "", transcript: "", lastUserText: "list /tmp" });
+    // There is no list to point at, so there is nothing to say and nothing to spend.
+    expect(fake.prompts).toHaveLength(1);
   });
 });
 

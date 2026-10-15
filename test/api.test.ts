@@ -298,6 +298,41 @@ describe("tool calling", () => {
     expect(choice.message.tool_calls).toBeUndefined();
   });
 
+  it("does not answer with a call the client never declared", async () => {
+    // The client's machine is the one that would run it, so a name it never offered is
+    // not the proxy's to dispatch.
+    calling('Listing it.\n```tool_call\n{"name": "list_dir", "arguments": {"path": "/tmp"}}\n```');
+    const choice = (await json(await post("/v1/chat/completions", ask({ tools: weather })))).choices[0];
+    expect(choice.finish_reason).toBe("stop");
+    expect(choice.message.tool_calls).toBeUndefined();
+    expect(choice.message.content).toBe("Listing it.");
+  });
+
+  it("takes a block it cannot read out of the answer", async () => {
+    calling("Here is the format:\n```tool_call\nnot json at all\n```");
+    const choice = (await json(await post("/v1/chat/completions", ask({ tools: weather })))).choices[0];
+    expect(choice.finish_reason).toBe("stop");
+    expect(choice.message.tool_calls).toBeUndefined();
+    expect(choice.message.content).toBe("Here is the format:");
+  });
+
+  it("streams an undeclared call as the prose around it", async () => {
+    calling('Listing it.\n```tool_call\n{"name": "list_dir", "arguments": {}}\n```');
+    const res = await post("/v1/chat/completions", ask({ tools: weather, stream: true }));
+    const { raw, frames } = await sse(res);
+    expect(raw).not.toContain("tool_call");
+    expect(frames.flatMap((f) => f.data?.choices?.[0]?.delta?.tool_calls ?? [])).toEqual([]);
+    expect(frames.filter((f) => f.data?.choices?.[0]?.finish_reason).at(-1)?.data.choices[0].finish_reason).toBe("stop");
+  });
+
+  it("leaves an undeclared call out of an Anthropic answer too", async () => {
+    calling('Listing it.\n```tool_call\n{"name": "list_dir", "arguments": {}}\n```');
+    const body = await json(await post("/v1/messages", ask({ tools: [{ name: "get_weather" }] })));
+    expect(body.stop_reason).toBe("end_turn");
+    expect(body.content.map((b: any) => b.type)).toEqual(["text"]);
+    expect(body.content[0].text).toBe("Listing it.");
+  });
+
   it("streams a tool call as one answer rather than leaking the block", async () => {
     calling();
     const res = await post("/v1/chat/completions", ask({ tools: weather, stream: true }));

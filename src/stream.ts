@@ -199,17 +199,18 @@ export const anthropicSink = (modelId: string): Sink => {
  *  arrives. A relay that fails before that is still reported as a normal JSON error
  *  with a real status code instead of an SSE frame on a 200.
  *
- *  `live` is false for a request whose answer may turn out to be a tool call: there is
- *  nothing to stream until the turn ends, so no event tail is opened and the whole
- *  answer goes out at once. */
+ *  `declared` is the caller's list of functions, and it decides both what may be handed
+ *  over and how the turn is read: with some, the answer may turn out to be a call and
+ *  there is nothing to stream until it ends, so it is answered in one piece; without
+ *  them the answer cannot be a call and streams as it goes. */
 export async function relay(
   c: Context,
   sink: Sink,
   run: (onSession?: (sid: string) => void) => Promise<any>,
   fail: (e: unknown) => Failure,
-  live = true
+  declared: readonly string[] = []
 ) {
-  if (!live) return once(c, sink, await settle(run()), fail);
+  if (declared.length) return once(c, sink, await settle(run()), fail, declared);
 
   const watch = { sid: null as string | null, sink };
   const conn = connectEvents(watch);
@@ -221,7 +222,7 @@ export async function relay(
 
   if (!started) {
     close();
-    return once(c, sink, await settled, fail);
+    return once(c, sink, await settled, fail, declared);
   }
 
   return commit(c, async (sse) => {
@@ -230,7 +231,7 @@ export async function relay(
       sink.attach(sse);
       const done = await settled;
       if (done.error) await sink.fail(describeError(done.error).message);
-      else await sink.finish(extractAnswer(done.result));
+      else await sink.finish(extractAnswer(done.result, declared));
     } finally {
       close();
     }
@@ -242,9 +243,9 @@ const settle = (run: Promise<any>): Promise<{ result?: any; error?: any }> =>
 
 /** The answer, given as one piece: what a sink already streamed is finished here, and a
  *  turn that said nothing at all is a failure rather than an empty 200. */
-async function once(c: Context, sink: Sink, done: { result?: any; error?: any }, fail: (e: unknown) => Failure) {
+async function once(c: Context, sink: Sink, done: { result?: any; error?: any }, fail: (e: unknown) => Failure, declared: readonly string[]) {
   if (done.error) return sendFailure(c, fail, done.error);
-  const answer = extractAnswer(done.result);
+  const answer = extractAnswer(done.result, declared);
   if (!answer.text && !answer.reasoning && !answer.toolCall) {
     return sendFailure(c, fail, new Error("empty response from opencode"));
   }

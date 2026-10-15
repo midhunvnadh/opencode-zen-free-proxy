@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { HttpError } from "../src/lib.ts";
 import {
+  announcedName,
   anthropicFailure,
   anthropicPrompt,
   anthropicResponse,
@@ -173,36 +174,81 @@ describe("telling the model about the caller's functions", () => {
 });
 
 describe("lifting a tool call out of the answer", () => {
+  /** A block the model writes to announce a call. */
+  const block = (name: string, args: unknown = {}) =>
+    "```tool_call\n" + JSON.stringify({ name, arguments: args }) + "\n```";
+
   it("reads a fenced call and keeps the prose around it", () => {
-    const { call, text } = parseToolCall('Let me look.\n```tool_call\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n```');
+    const { call, text } = parseToolCall(`Let me look.\n${block("get_weather", { city: "Paris" })}`, ["get_weather"]);
     expect(call).toMatchObject({ name: "get_weather", arguments: { city: "Paris" } });
     expect(call?.id).toMatch(/^call_/);
     expect(text).toBe("Let me look.");
   });
 
   it("defaults the arguments to an empty object", () => {
-    expect(parseToolCall('```tool_call\n{"name": "now"}\n```').call).toMatchObject({ name: "now", arguments: {} });
+    expect(parseToolCall(block("now"), ["now"]).call).toMatchObject({ name: "now", arguments: {} });
   });
 
   it("leaves an answer that holds no call alone", () => {
-    expect(parseToolCall("just prose").call).toBeUndefined();
-    expect(parseToolCall("just prose").text).toBe("just prose");
+    expect(parseToolCall("just prose", ["now"]).call).toBeUndefined();
+    expect(parseToolCall("just prose", ["now"]).text).toBe("just prose");
   });
 
-  it("leaves a malformed block alone rather than failing the request", () => {
+  it("does not hand over a function the client never declared", () => {
+    // The client's machine is the one that would run it, so a name it never offered is
+    // not the proxy's to dispatch.
+    const { call, text } = parseToolCall(`Listing it.\n${block("list_dir", { path: "/tmp" })}`, ["read_log"]);
+    expect(call).toBeUndefined();
+    // The block is the proxy's own markup, so it is not answer text either.
+    expect(text).toBe("Listing it.");
+  });
+
+  it("hands over nothing when the client declared nothing", () => {
+    expect(parseToolCall(block("read_log"), []).call).toBeUndefined();
+  });
+
+  it("takes the block out of the answer even when it cannot be read", () => {
     const raw = "```tool_call\nnot json at all\n```";
-    expect(parseToolCall(raw).call).toBeUndefined();
-    expect(parseToolCall(raw).text).toBe(raw);
+    expect(parseToolCall(raw, ["now"]).call).toBeUndefined();
+    expect(parseToolCall(raw, ["now"]).text).toBe("");
+  });
+
+  it("takes out the instruction block the model copied back verbatim", () => {
+    // The instruction is what the model is likeliest to echo: its JSON is not valid and
+    // what surrounds it is the proxy's wording, not anything the caller wrote.
+    const copied = toolInstructions([{ name: "read_log", description: "reads a file" }]);
+    const { call, text } = parseToolCall(copied, ["read_log"]);
+    expect(call).toBeUndefined();
+    expect(text).not.toContain("tool_call");
+    expect(text).not.toContain("arguments schema");
+  });
+
+  it("takes out an opener a truncated turn left unclosed", () => {
+    const { call, text } = parseToolCall('Let me look.\n```tool_call\n{"name": "now", "argu', ["now"]);
+    expect(call).toBeUndefined();
+    expect(text).toBe("Let me look.");
+  });
+
+  it("reads the name the model announced, declared or not", () => {
+    expect(announcedName(block("list_dir"))).toBe("list_dir");
+    expect(announcedName("just prose")).toBeNull();
+    expect(announcedName("```tool_call\nnot json\n```")).toBeNull();
   });
 
   it("reaches the answer through the message the backend returned", () => {
-    const answer = extractAnswer({
-      content: [{ type: "text", text: '```tool_call\n{"name": "now", "arguments": {}}\n```' }],
-      tokens: { input: 3, output: 1 },
-    });
+    const answer = extractAnswer({ content: [{ type: "text", text: block("now") }], tokens: { input: 3, output: 1 } }, ["now"]);
     expect(answer.toolCall).toMatchObject({ name: "now" });
     // The markup is the proxy's, not the client's, so it is not part of the answer.
     expect(answer.text).toBe("");
+  });
+
+  it("leaves an undeclared call out of the answer altogether", () => {
+    const answer = extractAnswer(
+      { content: [{ type: "text", text: `Listing it.\n${block("list_dir")}` }], tokens: { input: 3, output: 1 } },
+      ["read_log"]
+    );
+    expect(answer.toolCall).toBeUndefined();
+    expect(answer.text).toBe("Listing it.");
   });
 });
 
