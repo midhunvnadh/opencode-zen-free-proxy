@@ -22,7 +22,7 @@ export interface Dialect {
 
 export const openai: Dialect = {
   fail: openaiFailure,
-  prompt: (body) => toPrompt(body.messages, body.tools),
+  prompt: (body) => toPrompt(body.messages, body.tools, body.tool_choice),
   sink: openaiSink,
   response: openaiResponse,
 };

@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { HttpError } from "../src/lib.ts";
 import {
+  announced,
   announcedName,
   anthropicFailure,
   anthropicPrompt,
   anthropicResponse,
   extractAnswer,
   extractMessage,
+  extractToolCalls,
   openaiFailure,
   openaiResponse,
   parseToolCall,
@@ -155,6 +157,29 @@ describe("the tool exchange", () => {
     expect(text).toContain("18C");
     expect(toolResultPrompt([])).toBe("");
   });
+
+  it("drops declared tools when tool_choice is none", () => {
+    const p1 = toPrompt([], [{ type: "function", function: { name: "get_weather" } }], "none");
+    expect(p1.tools.declared).toEqual([]);
+
+    const p2 = toPrompt([], [{ type: "function", function: { name: "get_weather" } }], { type: "none" });
+    expect(p2.tools.declared).toEqual([]);
+  });
+
+  it("filters declared tools when tool_choice specifies a forced function", () => {
+    const tools = [
+      { type: "function", function: { name: "tool_a" } },
+      { type: "function", function: { name: "tool_b" } },
+    ];
+    const pOpenAI = toPrompt([], tools, { type: "function", function: { name: "tool_b" } });
+    expect(pOpenAI.tools.declared.map((t) => t.name)).toEqual(["tool_b"]);
+
+    const pAnthropic = toPrompt([], tools, { type: "tool", name: "tool_a" });
+    expect(pAnthropic.tools.declared.map((t) => t.name)).toEqual(["tool_a"]);
+
+    const pNotFound = toPrompt([], tools, { type: "tool", name: "non_existent" });
+    expect(pNotFound.tools.declared).toEqual([]);
+  });
 });
 
 describe("telling the model about the caller's functions", () => {
@@ -170,6 +195,22 @@ describe("telling the model about the caller's functions", () => {
 
   it("says nothing when there are no functions", () => {
     expect(toolInstructions([])).toBe("");
+  });
+
+  it("adds required requirement when tool_choice is required or any", () => {
+    const textRequired = toolInstructions([weather], "required");
+    expect(textRequired).toContain("You MUST call one of the caller's functions this turn.");
+
+    const textAny = toolInstructions([weather], { type: "any" });
+    expect(textAny).toContain("You MUST call one of the caller's functions this turn.");
+  });
+
+  it("adds forced tool requirement when tool_choice forces a specific tool", () => {
+    const textOpenAI = toolInstructions([weather], { type: "function", function: { name: "get_weather" } });
+    expect(textOpenAI).toContain('You MUST call the tool "get_weather" this turn.');
+
+    const textAnthropic = toolInstructions([weather], { type: "tool", name: "get_weather" });
+    expect(textAnthropic).toContain('You MUST call the tool "get_weather" this turn.');
   });
 });
 
@@ -233,6 +274,25 @@ describe("lifting a tool call out of the answer", () => {
     expect(announcedName(block("list_dir"))).toBe("list_dir");
     expect(announcedName("just prose")).toBeNull();
     expect(announcedName("```tool_call\nnot json\n```")).toBeNull();
+  });
+
+  it("announced skips malformed tool blocks to find a subsequent valid tool block", () => {
+    const text = 'Here: ```tool_call\n{"name": "bad", "arguments": [1, 2]}\n```\nAnd then:\n<tool_call>\n{"name": "good", "arguments": {"x": 1}}\n</tool_call>';
+    expect(announced(text)).toEqual({ name: "good", arguments: { x: 1 } });
+  });
+
+  it("announced returns null when all tool blocks are invalid or have invalid arguments", () => {
+    const text = '```tool_call\n{"name": "bad", "arguments": "invalid"}\n```\n<tool_call>broken json</tool_call>';
+    expect(announced(text)).toBeNull();
+  });
+
+  it("extracts multiple tool calls and strips markers from clean text", () => {
+    const text = 'Start.\n<tool_call>{"name": "t1", "arguments": {"a": 1}}</tool_call>\nMiddle.\n<tool_call>{"name": "t2", "arguments": {"b": 2}}</tool_call>\nEnd.';
+    const { clean, calls } = extractToolCalls(text, ["t1", "t2"]);
+    expect(clean).toBe("Start.\n\nMiddle.\n\nEnd.");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ name: "t1", arguments: { a: 1 } });
+    expect(calls[1]).toMatchObject({ name: "t2", arguments: { b: 2 } });
   });
 
   it("reaches the answer through the message the backend returned", () => {
@@ -345,6 +405,38 @@ describe("responses", () => {
   it("keeps a text block alongside an Anthropic tool call", () => {
     const r = anthropicResponse("m", { ...answer, toolCall: { id: "toolu_1", name: "t", arguments: {} } }) as any;
     expect(r.content.map((b: any) => b.type)).toEqual(["text", "tool_use"]);
+  });
+
+  it("shapes multiple OpenAI tool calls", () => {
+    const r = openaiResponse("m", {
+      ...answer,
+      text: "",
+      reasoning: "",
+      toolCalls: [
+        { id: "call_1", name: "t1", arguments: { a: 1 } },
+        { id: "call_2", name: "t2", arguments: { b: 2 } },
+      ],
+    }) as any;
+    expect(r.choices[0].finish_reason).toBe("tool_calls");
+    expect(r.choices[0].message.tool_calls).toHaveLength(2);
+    expect(r.choices[0].message.tool_calls[0].id).toBe("call_1");
+    expect(r.choices[0].message.tool_calls[1].id).toBe("call_2");
+  });
+
+  it("shapes multiple Anthropic tool calls", () => {
+    const r = anthropicResponse("m", {
+      ...answer,
+      text: "",
+      reasoning: "",
+      toolCalls: [
+        { id: "call_1", name: "t1", arguments: { a: 1 } },
+        { id: "call_2", name: "t2", arguments: { b: 2 } },
+      ],
+    }) as any;
+    expect(r.stop_reason).toBe("tool_use");
+    expect(r.content).toHaveLength(2);
+    expect(r.content[0]).toMatchObject({ type: "tool_use", id: "call_1", name: "t1" });
+    expect(r.content[1]).toMatchObject({ type: "tool_use", id: "call_2", name: "t2" });
   });
 
   it("shapes an Anthropic message", () => {

@@ -79,14 +79,24 @@ const functionName = (t: any) =>
  *  Anthropic calls them `input_schema` and `tool_use_id`, and puts the result in a
  *  `tool_result` block. Names are resolved from the call that asked for them, so the
  *  result text can say which tool it came from. */
-function toolExchange(tools: any, messages: any[]): Tools {
-  const declared: ToolSpec[] = (Array.isArray(tools) ? tools : [])
+function toolExchange(tools: any, messages: any[], toolChoice?: any): Tools {
+  let declared: ToolSpec[] = (Array.isArray(tools) ? tools : [])
     .map((t: any) => ({
       name: functionName(t),
       description: t?.function?.description ?? t?.description,
       parameters: t?.function?.parameters ?? t?.input_schema,
     }))
     .filter((t) => t.name);
+
+  if (toolChoice === "none" || toolChoice?.type === "none") {
+    declared = [];
+  } else if (typeof toolChoice === "object" && toolChoice !== null) {
+    const forced = toolChoice.function?.name || toolChoice.name;
+    if (forced && typeof forced === "string") {
+      declared = declared.filter((t) => t.name === forced);
+    }
+  }
+
   const called = new Map<string, string>();
   const results: ToolResult[] = [];
   const result = (id: any, content: any) => {
@@ -108,7 +118,7 @@ function toolExchange(tools: any, messages: any[]): Tools {
 
 /** Flattens a conversation into one prompt: the system instructions, the whole
  *  transcript, the last user turn on its own, and the tool exchange. */
-export function toPrompt(messages: any[], tools?: any): Prompt {
+export function toPrompt(messages: any[], tools?: any, toolChoice?: any): Prompt {
   let system = "";
   let lastResult = -1;
   const turns: string[] = [];
@@ -129,17 +139,28 @@ export function toPrompt(messages: any[], tools?: any): Prompt {
   // A question asked before the result has already been asked: the result is its answer,
   // so putting it in the prompt again would send the model round the loop again.
   const lastUserText = (lastResult < 0 ? asked : asked.filter((t) => t.at > lastResult)).at(-1)?.text ?? "";
-  return { system, transcript: turns.join("\n\n"), lastUserText, tools: toolExchange(tools, messages) };
+  return { system, transcript: turns.join("\n\n"), lastUserText, tools: toolExchange(tools, messages, toolChoice) };
 }
 
 /** The caller's functions, described for the model. opencode's tool list cannot be
  *  replaced, so this is the only way a client tool reaches the model at all — and it is
  *  why a blocked tool is refused rather than run: the model has to use these instead. */
-export function toolInstructions(declared: ToolSpec[]): string {
+export function toolInstructions(declared: ToolSpec[], toolChoice?: any): string {
   if (!declared.length) return "";
   const list = declared
     .map((t) => `- ${t.name}${t.description ? `: ${t.description}` : ""}${t.parameters ? ` arguments schema: ${JSON.stringify(t.parameters)}` : ""}`)
     .join("\n");
+
+  let requirement = "";
+  if (toolChoice === "required" || toolChoice?.type === "any") {
+    requirement = "\n\nYou MUST call one of the caller's functions this turn.";
+  } else if (typeof toolChoice === "object" && toolChoice !== null) {
+    const forced = toolChoice.function?.name || toolChoice.name;
+    if (forced && typeof forced === "string") {
+      requirement = `\n\nYou MUST call the tool "${forced}" this turn.`;
+    }
+  }
+
   return `You can call functions on the caller's machine, and none of your own tools are available. When you need one, reply with a single fenced block and nothing after it:
 
 \`\`\`tool_call
@@ -147,7 +168,7 @@ export function toolInstructions(declared: ToolSpec[]): string {
 \`\`\`
 
 The caller's functions:
-${list}`;
+${list}${requirement}`;
 }
 
 /** The model announces a call in a fenced block, XML block, or bracket block. */
@@ -190,21 +211,68 @@ export function partialOpenHold(rest: string): number {
 }
 
 export function parseToolBody(body: string): { name: string; arguments: Record<string, unknown> } | null {
+  if (!body || !body.trim()) return null;
+  let cleaned = body.trim();
+  // Strip inner markdown fences if model wrapped JSON in code fences inside the tool block
+  cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  const sanitize = (s: string) => s.replace(/,\s*([\}\]])/g, "$1").replace(/,\s*$/, "").trim();
+
+  let said: any;
   try {
-    const said = JSON.parse(body.trim());
-    const name = said?.name || said?.function?.name;
-    const args = said?.arguments ?? said?.parameters ?? said?.args ?? {};
-    if (name && typeof name === "string") {
-      let parsedArgs: Record<string, unknown> = {};
-      if (typeof args === "string") {
-        try { parsedArgs = JSON.parse(args); } catch { parsedArgs = {}; }
-      } else if (typeof args === "object" && args !== null) {
-        parsedArgs = args as Record<string, unknown>;
-      }
-      return { name, arguments: parsedArgs };
+    said = JSON.parse(cleaned);
+  } catch {
+    try {
+      said = JSON.parse(sanitize(cleaned));
+    } catch {
+      return null;
     }
-  } catch {}
-  return null;
+  }
+
+  if (typeof said !== "object" || said === null || Array.isArray(said)) {
+    return null;
+  }
+
+  const name = said.name || said.function?.name;
+  if (typeof name !== "string" || !name.trim()) {
+    return null;
+  }
+
+  const rawArgs = said.arguments ?? said.parameters ?? said.args;
+  let parsedArgs: Record<string, unknown> = {};
+
+  if (typeof rawArgs === "string") {
+    const s = rawArgs.trim();
+    if (s) {
+      try {
+        const decoded = JSON.parse(s);
+        if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
+          return null;
+        }
+        parsedArgs = decoded as Record<string, unknown>;
+      } catch {
+        try {
+          const decoded = JSON.parse(sanitize(s));
+          if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
+            return null;
+          }
+          parsedArgs = decoded as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      }
+    }
+  } else if (typeof rawArgs === "object" && rawArgs !== null) {
+    if (Array.isArray(rawArgs)) {
+      return null;
+    }
+    parsedArgs = rawArgs as Record<string, unknown>;
+  } else if (rawArgs === undefined || rawArgs === null) {
+    parsedArgs = {};
+  } else {
+    return null;
+  }
+
+  return { name: name.trim(), arguments: parsedArgs };
 }
 
 export function streamingView(text: string, declared: readonly string[] = []): { clean: string; calls: ToolCall[] } {
@@ -268,12 +336,18 @@ export function extractToolCalls(text: string, declared: readonly string[] = [])
 /** What a fenced or XML block asks for, or null when the text holds none or it cannot be read.
  *  Whether the client offered the function is not decided here. */
 export function announced(text: string): { name: string; arguments: Record<string, unknown> } | null {
-  const nxt = findNextOpen(text, 0);
-  if (!nxt) return null;
-  const k = text.indexOf(nxt.close, nxt.idx + nxt.open.length);
-  if (k < 0) return null;
-  const body = text.slice(nxt.idx + nxt.open.length, k);
-  return parseToolBody(body);
+  let i = 0;
+  while (i < text.length) {
+    const nxt = findNextOpen(text, i);
+    if (!nxt) break;
+    const k = text.indexOf(nxt.close, nxt.idx + nxt.open.length);
+    if (k < 0) break;
+    const body = text.slice(nxt.idx + nxt.open.length, k);
+    const parsed = parseToolBody(body);
+    if (parsed) return parsed;
+    i = k + nxt.close.length;
+  }
+  return null;
 }
 
 /** The block is the proxy's own convention, so it is never part of the answer — not when
@@ -444,7 +518,7 @@ export function flattenDelta(
 
 export function anthropicPrompt(body: any): Prompt {
   // Anthropic keeps the system prompt next to the messages, not inside them.
-  return { ...toPrompt(body.messages, body.tools), system: extractText(body.system) };
+  return { ...toPrompt(body.messages, body.tools, body.tool_choice), system: extractText(body.system) };
 }
 
 /** Flattens an assistant message from the backend into text, reasoning and usage. */

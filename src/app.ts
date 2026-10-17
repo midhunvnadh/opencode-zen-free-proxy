@@ -31,7 +31,7 @@ const completion: Handler<Env> = async (c) => {
       key: sessionKey(c, body),
       modelId,
       system,
-      directives: toolInstructions(tools.declared),
+      directives: toolInstructions(tools.declared, body.tool_choice),
       transcript,
       lastUserText,
       toolNames: names,
