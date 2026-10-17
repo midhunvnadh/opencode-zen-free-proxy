@@ -375,3 +375,51 @@ describe("failures", () => {
     expect(openaiFailure(new Error("connection reset")).status).toBe(502);
   });
 });
+
+describe("XML tool calls & delta flattening", () => {
+  it("parses XML <tool_call> and keeps prose around it", async () => {
+    const { parseToolCall } = await import("../src/protocols.ts");
+    const xml = "Let me look.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>";
+    const { call, text } = parseToolCall(xml, ["get_weather"]);
+    expect(call).toMatchObject({ name: "get_weather", arguments: { city: "Tokyo" } });
+    expect(call?.id).toMatch(/^call_/);
+    expect(text).toBe("Let me look.");
+  });
+
+  it("parses bracket [tool_call] as backward compatibility", async () => {
+    const { parseToolCall } = await import("../src/protocols.ts");
+    const bracket = "Checking...\n[tool_call]\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Berlin\"}}\n[/tool_call]";
+    const { call, text } = parseToolCall(bracket, ["get_weather"]);
+    expect(call).toMatchObject({ name: "get_weather", arguments: { city: "Berlin" } });
+    expect(text).toBe("Checking...");
+  });
+
+  it("flattens delta turns without duplicating backend-held state", async () => {
+    const { flattenDelta } = await import("../src/protocols.ts");
+    const tail = [
+      { role: "assistant", content: "Stored answer" },
+      { role: "user", content: "What is next?" },
+    ];
+    const prompt = flattenDelta(tail, { lastReply: "Stored answer", lastReasoning: "" });
+    expect(prompt).toBe("User: What is next?");
+    expect(prompt).not.toContain("Stored answer");
+  });
+
+  it("preserves assistant tool calls in delta turns", async () => {
+    const { flattenDelta } = await import("../src/protocols.ts");
+    const tail = [
+      {
+        role: "assistant",
+        content: "Calling tool",
+        tool_calls: [{ id: "call_123", function: { name: "read_file", arguments: "{\"path\":\"/tmp\"}" } }],
+      },
+      { role: "tool", tool_call_id: "call_123", name: "read_file", content: "file contents" },
+    ];
+    const prompt = flattenDelta(tail, { lastReply: "Calling tool", lastReasoning: "" });
+    expect(prompt).toContain("[assistant tool calls]");
+    expect(prompt).toContain("- read_file({\"path\":\"/tmp\"}) (call call_123)");
+    expect(prompt).toContain("[tool result: read_file] (call call_123)");
+    expect(prompt).toContain("<result>\nfile contents\n</result>");
+  });
+});
+

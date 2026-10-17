@@ -51,6 +51,7 @@ export async function pump(stream: ReadableStream<Uint8Array>, onText: (text: st
 /** Bun has no synchronous stat, so the backend binary is resolved once here while the
  *  process starts up; everything after the config import sees a real path. */
 export async function findBinary(): Promise<string> {
+  if (typeof Bun === "undefined") return "opencode";
   const home = process.env.HOME || "";
   const candidates = [
     home && `${home}/.opencode/bin/opencode`,

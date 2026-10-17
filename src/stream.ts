@@ -2,7 +2,7 @@ import { streamSSE, type SSEStreamingApi } from "hono/streaming";
 import type { Context } from "hono";
 import { describeError, nowSeconds, rid } from "./lib.ts";
 import { connectEvents } from "./opencode.ts";
-import { anthropicStopReason, extractAnswer, openaiFinish, openaiToolCall, openaiUsage, sendFailure, toolArguments, type Answer, type Failure, type ToolCall } from "./protocols.ts";
+import { anthropicStopReason, extractAnswer, openaiFinish, openaiToolCall, openaiUsage, sendFailure, toolArguments, ToolCallStreamParser, type Answer, type Failure, type ToolCall } from "./protocols.ts";
 
 /** The two streaming sinks and the relay that connects them to a request. A sink
  *  writes provider-shaped SSE frames into a buffer and only reaches the client once
@@ -66,12 +66,14 @@ function tail() {
   };
 }
 
-export const openaiSink = (modelId: string): Sink => {
+export const openaiSink = (modelId: string, declared: readonly string[] = []): Sink => {
   const id = rid("chatcmpl-");
   const created = nowSeconds();
   const out = buffer();
   const seen = tail();
+  const parser = declared.length ? new ToolCallStreamParser(declared) : null;
   let sentTool = false;
+  let toolIndex = 0;
   const chunk = (delta: object, finish?: string, usage?: object) =>
     out.send(JSON.stringify({
       id, object: "chat.completion.chunk", created, model: modelId,
@@ -82,28 +84,57 @@ export const openaiSink = (modelId: string): Sink => {
   // A tool call is a single frame: the client needs the name and the whole argument
   // string together to run it.
   const tool = (call: ToolCall) => {
-    if (sentTool) return;
     sentTool = true;
     if (!open()) return;
-    chunk({ tool_calls: [{ index: 0, ...openaiToolCall(call) }] });
+    chunk({ tool_calls: [{ index: toolIndex++, ...openaiToolCall(call) }] });
   };
 
   return {
     whenOpened: out.whenOpened,
     attach: out.attach,
     delta(kind, text) {
-      if (!open()) return;
-      seen.record(kind, text);
-      chunk(kind === "reasoning" ? { reasoning_content: text } : { content: text });
+      if (kind === "reasoning") {
+        if (!open()) return;
+        seen.record("reasoning", text);
+        chunk({ reasoning_content: text });
+        return;
+      }
+      if (parser) {
+        const visible = parser.feed(text);
+        if (visible) {
+          if (!open()) return;
+          seen.record("text", visible);
+          chunk({ content: visible });
+        }
+        for (const call of parser.drainCalls()) {
+          tool(call);
+        }
+      } else {
+        if (!open()) return;
+        seen.record("text", text);
+        chunk({ content: text });
+      }
     },
     finish(answer) {
       if (!open()) return out.flush();
       const reasoning = seen.unseen(answer.reasoning, "reasoning");
-      const text = seen.unseen(answer.text);
       if (reasoning) chunk({ reasoning_content: reasoning });
-      if (text) chunk({ content: text });
-      if (answer.toolCall) tool(answer.toolCall);
-      chunk({}, openaiFinish(answer), openaiUsage(answer));
+      if (parser) {
+        const { text, calls } = parser.finish(answer.text);
+        if (text) {
+          seen.record("text", text);
+          chunk({ content: text });
+        }
+        for (const call of calls) tool(call);
+      } else {
+        const text = seen.unseen(answer.text);
+        if (text) chunk({ content: text });
+      }
+      if (!sentTool) {
+        const calls = answer.toolCalls && answer.toolCalls.length ? answer.toolCalls : answer.toolCall ? [answer.toolCall] : [];
+        for (const call of calls) tool(call);
+      }
+      chunk({}, openaiFinish(answer, sentTool), openaiUsage(answer));
       out.send("[DONE]");
       return out.flush();
     },
@@ -116,10 +147,12 @@ export const openaiSink = (modelId: string): Sink => {
   };
 };
 
-export const anthropicSink = (modelId: string): Sink => {
+export const anthropicSink = (modelId: string, declared: readonly string[] = []): Sink => {
   const id = rid("msg_");
   const out = buffer();
   const seen = tail();
+  const parser = declared.length ? new ToolCallStreamParser(declared) : null;
+  let sentTool = false;
   let block: string | null = null;
   let tool: ToolCall | null = null;
   let index = -1;
@@ -155,6 +188,7 @@ export const anthropicSink = (modelId: string): Sink => {
   // A tool_use block carries its arguments as one input_json_delta holding the whole
   // object, which is what the client needs to run the call.
   const emitTool = (call: ToolCall) => {
+    sentTool = true;
     openBlock("tool", call);
     send("content_block_delta", {
       type: "content_block_delta", index,
@@ -166,21 +200,51 @@ export const anthropicSink = (modelId: string): Sink => {
     whenOpened: out.whenOpened,
     attach: out.attach,
     delta(kind, text) {
-      if (!open()) return;
-      seen.record(kind, text);
-      emit(kind === "reasoning" ? "thinking" : "text", text);
+      if (kind === "reasoning") {
+        if (!open()) return;
+        seen.record("reasoning", text);
+        emit("thinking", text);
+        return;
+      }
+      if (parser) {
+        const visible = parser.feed(text);
+        if (visible) {
+          if (!open()) return;
+          seen.record("text", visible);
+          emit("text", visible);
+        }
+        for (const call of parser.drainCalls()) {
+          emitTool(call);
+        }
+      } else {
+        if (!open()) return;
+        seen.record("text", text);
+        emit("text", text);
+      }
     },
     finish(answer) {
       if (!open()) return out.flush();
       const reasoning = seen.unseen(answer.reasoning, "reasoning");
-      const text = seen.unseen(answer.text);
       if (reasoning) emit("thinking", reasoning);
-      if (text) emit("text", text);
-      if (answer.toolCall) emitTool(answer.toolCall);
+      if (parser) {
+        const { text, calls } = parser.finish(answer.text);
+        if (text) {
+          seen.record("text", text);
+          emit("text", text);
+        }
+        for (const call of calls) emitTool(call);
+      } else {
+        const text = seen.unseen(answer.text);
+        if (text) emit("text", text);
+      }
+      if (!sentTool) {
+        const calls = answer.toolCalls && answer.toolCalls.length ? answer.toolCalls : answer.toolCall ? [answer.toolCall] : [];
+        for (const call of calls) emitTool(call);
+      }
       if (block) send("content_block_stop", { type: "content_block_stop", index });
       send("message_delta", {
         type: "message_delta",
-        delta: { stop_reason: anthropicStopReason(answer) },
+        delta: { stop_reason: anthropicStopReason(answer, sentTool) },
         usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
       });
       send("message_stop", { type: "message_stop" });
@@ -192,7 +256,7 @@ export const anthropicSink = (modelId: string): Sink => {
       return out.flush();
     },
   };
-}
+};
 
 /** Answers one streaming request. A sink reaches the client only once it is attached to
  *  the response stream, so the relay holds the response back until the first token
@@ -200,9 +264,8 @@ export const anthropicSink = (modelId: string): Sink => {
  *  with a real status code instead of an SSE frame on a 200.
  *
  *  `declared` is the caller's list of functions, and it decides both what may be handed
- *  over and how the turn is read: with some, the answer may turn out to be a call and
- *  there is nothing to stream until it ends, so it is answered in one piece; without
- *  them the answer cannot be a call and streams as it goes. */
+ *  over and how the turn is read. With ToolCallStreamParser, tools stream live tokens
+ *  while buffering `<tool_call>` syntax safely. */
 export async function relay(
   c: Context,
   sink: Sink,
@@ -210,8 +273,6 @@ export async function relay(
   fail: (e: unknown) => Failure,
   declared: readonly string[] = []
 ) {
-  if (declared.length) return once(c, sink, await settle(run()), fail, declared);
-
   const watch = { sid: null as string | null, sink };
   const conn = connectEvents(watch);
   const close = () => conn.close();

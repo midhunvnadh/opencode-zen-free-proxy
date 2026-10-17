@@ -42,6 +42,7 @@ RUN mkdir -p /home/app/.local/share/opencode /app/oc-workspace /keys \
 
 COPY --chown=app:app --from=opencode /usr/local/bun/install/global/node_modules/@opencode/cli/bin/opencode.exe /usr/local/bin/opencode
 COPY --chown=app:app --from=build /out/proxy /app/proxy
+COPY --chown=app:app .opencode /app/oc-workspace/.opencode
 
 # OC_BIN is an absolute path so the proxy never has to search PATH.
 # OC_WORKDIR / KEYS_FILE are written at runtime, so they must stay writable.

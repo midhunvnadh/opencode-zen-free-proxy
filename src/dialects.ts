@@ -16,7 +16,7 @@ import { anthropicSink, openaiSink, type Sink } from "./stream.ts";
 export interface Dialect {
   fail: (e: unknown) => Failure;
   prompt: (body: any) => Prompt;
-  sink: (modelId: string) => Sink;
+  sink: (modelId: string, declared?: readonly string[]) => Sink;
   response: (modelId: string, answer: Answer) => object;
 }
 

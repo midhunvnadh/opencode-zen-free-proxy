@@ -37,12 +37,14 @@ const completion: Handler<Env> = async (c) => {
       toolNames: names,
       toolResults: toolResultPrompt(tools.results),
       onSession,
+      messages: body.messages,
+      tools: body.tools,
+      toolChoice: body.tool_choice,
     });
 
-  // A model announces a tool call in the same text as its answer, so a request that
-  // offers tools cannot stream as it goes: the client would be handed both the call and
-  // the prose around it. It waits and is answered in one piece.
-  if (body.stream) return relay(c, d.sink(modelId), ask, d.fail, names);
+  // When streaming with tools, ToolCallStreamParser buffers tool_call blocks
+  // while streaming surrounding text tokens in real time.
+  if (body.stream) return relay(c, d.sink(modelId, names), ask, d.fail, names);
 
   const answer = extractAnswer(await ask(), names);
   if (!answer.text && !answer.reasoning && !answer.toolCall) throw new HttpError(502, "empty response from opencode");

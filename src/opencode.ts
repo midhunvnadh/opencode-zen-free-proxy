@@ -1,6 +1,13 @@
 import { OC_BIN, OC_PASSWORD, OC_SERVER, OC_USERNAME, OC_WORKDIR, REQUEST_TIMEOUT } from "./config.ts";
 import { HttpError, basicAuth, pump, randomHex, rid, sleep } from "./lib.ts";
-import { announcedName, extractMessage } from "./protocols.ts";
+import { announcedName, extractMessage, flattenDelta } from "./protocols.ts";
+import {
+  digestsOf,
+  dropEchoedAssistant,
+  globalRegistry,
+  shouldSendToolBlock,
+  toolsSignature,
+} from "./registry.ts";
 
 /** Everything the proxy needs to talk to one `opencode serve` backend: spawning or
  *  reusing it, the request plumbing, the model list, the conversations and the event
@@ -39,21 +46,55 @@ export async function request(method: string, pathname: string, body?: unknown, 
   }
 }
 
-let models: string[] | null = null;
+export const KNOWN_MODELS = [
+  "big-pickle",
+  "exo-free",
+  "ling-3.0-flash-fin-free",
+  "ling-3.1-flash-free",
+  "longcat-2.5-preview-free",
+  "mimo-v2.6-flash-free",
+  "muse-spark-1.3-contributor-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+  "space-bunny-free",
+  "step-5-preview-free",
+];
+
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+let cachedModels: string[] | null = null;
+let cachedModelsAt = 0;
 
 export async function listModels(): Promise<string[]> {
-  if (models) return models;
-  const r = await request("GET", "/api/model");
-  if (r.status !== 200 || !Array.isArray(r.json?.data)) throw new HttpError(502, "failed to list opencode models");
-  const found: string[] = r.json.data
-    .filter((m: any) => m.providerID === "opencode")
-    .map((m: any) => m.id || m.modelID)
-    .filter(Boolean);
-  if (!found.length) throw new HttpError(502, "no opencode models found");
-  return (models = found);
+  const now = Date.now();
+  if (cachedModels && now - cachedModelsAt < MODELS_CACHE_TTL_MS) {
+    return cachedModels;
+  }
+  try {
+    const r = await request("GET", "/api/model");
+    if (r.status === 200 && Array.isArray(r.json?.data)) {
+      const found: string[] = r.json.data
+        .filter((m: any) => m.providerID === "opencode")
+        .filter((m: any) => {
+          if (m.cost && (m.cost.input !== 0 || m.cost.output !== 0)) return false;
+          if (m.status === "deprecated") return false;
+          return true;
+        })
+        .map((m: any) => m.id || m.modelID)
+        .filter(Boolean);
+      if (found.length) {
+        cachedModels = found;
+        cachedModelsAt = now;
+        return found;
+      }
+    }
+  } catch {}
+
+  cachedModels = [...KNOWN_MODELS];
+  cachedModelsAt = now;
+  return cachedModels;
 }
 
-export const modelCount = () => (models ? models.length : 0);
+export const modelCount = () => (cachedModels ? cachedModels.length : KNOWN_MODELS.length);
 
 // A conversation is a session plus the turns already spent on it. Turns are chained
 // because opencode answers one session in order. `intercept` records whether the session
@@ -83,7 +124,7 @@ async function latestAssistant(sid: string) {
 async function createSession(modelId: string, intercept: boolean) {
   const r = await request("POST", "/api/session", {
     title: "proxy",
-    agent: "build",
+    agent: "bypass-lite",
     model: { id: modelId, providerID: "opencode" },
     // Tools are the client's to run, so every one of them asks first. That is what puts
     // a stop between the model's request and the execution — see docs/tool-calling.md.
@@ -185,13 +226,58 @@ export async function askModel(req: {
   toolNames?: string[];
   toolResults?: string;
   onSession?: (sid: string) => void;
+  messages?: any[];
+  tools?: any[];
+  toolChoice?: any;
 }) {
-  const { key, modelId, system, transcript, lastUserText, onSession } = req;
+  const { key, modelId, system, transcript, lastUserText, onSession, messages, tools, toolChoice } = req;
   const names = req.toolNames ?? [];
   const intercept = names.length > 0;
   // The request, then what the caller ran in answer to it, then how to call it. The
   // directives go last because a model follows what it reads most recently.
   const prompt = (...parts: (string | undefined)[]) => parts.filter(Boolean).join("\n\n");
+
+  // When messages are passed, use the transparent digest-prefix registry for multi-turn sessions
+  if (Array.isArray(messages) && messages.length > 0) {
+    const digests = digestsOf(messages);
+    const toolsSig = toolsSignature(tools, toolChoice);
+    const matched = globalRegistry.match(digests, toolsSig, key);
+
+    if (matched) {
+      const sid = matched.sid;
+      onSession?.(sid);
+      let tail = messages.slice(matched.digests.length);
+      tail = dropEchoedAssistant(tail, matched.lastReply, matched.lastReasoning);
+      const deltaText = flattenDelta(tail, matched);
+      const sendTools = shouldSendToolBlock("delta", matched, names.length > 0, toolsSig);
+      const toolDirectives = sendTools ? req.directives : undefined;
+      const text = prompt(deltaText || lastUserText, req.toolResults, toolDirectives);
+
+      try {
+        const message = await runPrompt(sid, text, "", names);
+        const ans = extractMessage(message);
+        globalRegistry.record(digests, sid, ans.text, ans.reasoning, toolsSig, key);
+        return message;
+      } catch (err) {
+        globalRegistry.markTainted(sid);
+        throw err;
+      }
+    }
+
+    const sid = await createSession(modelId, intercept);
+    onSession?.(sid);
+    const text = prompt(transcript || lastUserText, req.toolResults, req.directives);
+
+    try {
+      const message = await runPrompt(sid, text, system, names);
+      const ans = extractMessage(message);
+      globalRegistry.record(digests, sid, ans.text, ans.reasoning, toolsSig, key);
+      return message;
+    } catch (err) {
+      request("DELETE", `/api/session/${sid}`).catch(() => {});
+      throw err;
+    }
+  }
 
   if (!key) {
     const sid = await createSession(modelId, intercept);
@@ -220,46 +306,190 @@ export async function askModel(req: {
   return run;
 }
 
-/** Tails the backend's event stream and pushes this request's deltas into the sink.
- *  Closing is idempotent: the caller holds the handle and closes it once the reply is
- *  done or the client left. */
-export function connectEvents(watch: Watch) {
-  const abort = new AbortController();
-  let closed = false;
-  const close = () => {
-    if (closed) return;
-    closed = true;
-    abort.abort();
-  };
-  (async () => {
-    try {
-      const res = await fetch(base + "/api/event", { headers: auth ? { Authorization: auth } : {}, signal: abort.signal });
-      if (!res.ok || !res.body) return;
-      let buf = "";
-      await pump(res.body, (text) => {
-        buf += text;
-        let i: number;
-        while ((i = buf.indexOf("\n\n")) !== -1) {
-          onFrame(watch, buf.slice(0, i));
-          buf = buf.slice(i + 2);
-        }
-      });
-    } catch {}
-    close();
-  })();
-  return { close };
+export interface EventHubStats {
+  connId: number;
+  state: "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECONNECTING";
+  subscribers: number;
+  events: number;
+  reconnects: number;
+  bytes: number;
 }
 
-function onFrame(watch: Watch, frame: string) {
-  const line = frame.split("\n").find((l) => l.startsWith("data:"));
-  if (!line) return;
-  let ev: any;
-  try { ev = JSON.parse(line.slice(5)); } catch { return; }
-  const data = ev.data || ev.properties || {};
-  if (!watch.sid || data.sessionID !== watch.sid || typeof data.delta !== "string" || !data.delta) return;
-  if (ev.type === "session.reasoning.delta") watch.sink.delta("reasoning", data.delta);
-  else if (ev.type === "session.text.delta") watch.sink.delta("text", data.delta);
+/** Single shared SSE reader on OpenCode's /api/event with reconnect watchdog and idle disconnect. */
+export class EventHub {
+  private subs = new Set<Watch>();
+  private abortController: AbortController | null = null;
+  private running = false;
+  private idleTimer: any = null;
+  private connId = 0;
+  private state: "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECONNECTING" = "DISCONNECTED";
+  private eventCount = 0;
+  private reconnectCount = 0;
+  private byteCount = 0;
+  public readonly getBaseUrl: () => string;
+  public readonly getAuth: () => string | null;
+  public readonly idleTimeoutMs: number;
+
+  constructor(
+    getBaseUrl: () => string,
+    getAuth: () => string | null,
+    idleTimeoutMs: number = 30_000
+  ) {
+    this.getBaseUrl = getBaseUrl;
+    this.getAuth = getAuth;
+    this.idleTimeoutMs = idleTimeoutMs;
+  }
+
+  subscribe(watch: Watch): { close: () => void } {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.subs.add(watch);
+    if (!this.running) {
+      this.startLoop();
+    }
+    return {
+      close: () => {
+        this.subs.delete(watch);
+        if (this.subs.size === 0 && this.running && !this.idleTimer) {
+          this.idleTimer = setTimeout(() => {
+            if (this.subs.size === 0) {
+              this.stop();
+            }
+          }, this.idleTimeoutMs);
+        }
+      },
+    };
+  }
+
+  stats(): EventHubStats {
+    return {
+      connId: this.connId,
+      state: this.state,
+      subscribers: this.subs.size,
+      events: this.eventCount,
+      reconnects: this.reconnectCount,
+      bytes: this.byteCount,
+    };
+  }
+
+  stop() {
+    this.running = false;
+    this.state = "DISCONNECTED";
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+  }
+
+  private async startLoop() {
+    this.running = true;
+    let backoff = 1000;
+    const maxBackoff = 15000;
+
+    while (this.running && (this.subs.size > 0 || this.idleTimer)) {
+      this.connId += 1;
+      this.state = this.reconnectCount > 0 ? "RECONNECTING" : "CONNECTING";
+      const ac = new AbortController();
+      this.abortController = ac;
+      const url = this.getBaseUrl() + "/api/event";
+      const authHeader = this.getAuth();
+
+      try {
+        const res = await fetch(url, {
+          headers: authHeader ? { Authorization: authHeader } : {},
+          signal: ac.signal,
+        });
+
+        if (!res.ok || !res.body) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        this.state = "CONNECTED";
+        backoff = 1000;
+
+        let buf = "";
+        await pump(res.body, (text) => {
+          this.byteCount += text.length;
+          buf += text;
+          let i: number;
+          while ((i = buf.indexOf("\n\n")) !== -1) {
+            this.dispatchFrame(buf.slice(0, i));
+            buf = buf.slice(i + 2);
+          }
+        });
+      } catch (err: any) {
+        if (ac.signal.aborted) break;
+      } finally {
+        if (this.abortController === ac) {
+          this.abortController = null;
+        }
+      }
+
+      if (!this.running || this.subs.size === 0) break;
+
+      this.reconnectCount += 1;
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, maxBackoff);
+    }
+
+    this.state = "DISCONNECTED";
+    this.running = false;
+  }
+
+  private dispatchFrame(frame: string) {
+    const line = frame.split("\n").find((l) => l.startsWith("data:"));
+    if (!line) return;
+    let ev: any;
+    try { ev = JSON.parse(line.slice(5)); } catch { return; }
+    this.eventCount += 1;
+    const data = ev?.data || ev?.properties || {};
+    if (!data.sessionID || typeof data.delta !== "string" || !data.delta) return;
+
+    for (const watch of this.subs) {
+      if (watch.sid && data.sessionID === watch.sid) {
+        if (ev.type === "session.reasoning.delta") watch.sink.delta("reasoning", data.delta);
+        else if (ev.type === "session.text.delta") watch.sink.delta("text", data.delta);
+      }
+    }
+  }
 }
+
+export const globalEventHub = new EventHub(() => base, () => auth);
+
+/** Tails the backend's event stream and pushes this request's deltas into the sink.
+ *  Uses globalEventHub so all concurrent requests share one persistent SSE connection. */
+export function connectEvents(watch: Watch) {
+  return globalEventHub.subscribe(watch);
+}
+
+const BYPASS_LITE_AGENT = `---
+description: Completion backend for the proxy; emits <tool_call> blocks when the client offers tools.
+mode: primary
+---
+You are a completion backend behind an OpenAI-compatible proxy. The entire conversation, including any prior tool activity, arrives as one labeled transcript; the backend's session state already holds earlier turns, so later prompts may contain only the newest messages.
+
+Respond as the assistant to the latest user turn. Match the conversation's language and tone. Do not ask the user questions, do not start tasks/plans/todos, and do not invoke the backend's built-in tool runner — the caller owns all tool orchestration.
+
+When the prompt includes a \`[client tools]\` section, you may need one or more of those tools. To call a tool, emit exactly this block (JSON object on one line is fine):
+
+<tool_call>
+{"name": "tool_name", "arguments": {"key": "value"}}
+</tool_call>
+
+Rules:
+- \`arguments\` must be a JSON object matching that tool's \`parameters\` schema.
+- Exactly one JSON object per tool call.
+- One block per tool call; normal text may appear before or after blocks.
+- Do not use markdown fences around the tool call.
+- Do not emit additional wrapper text inside the tool-call block.
+- Only use tools listed under \`[client tools]\`; never invent tools.
+- Never emit \`<tool_call>\` when that section is absent — answer directly in text.
+- Never wrap answers in think tags — the proxy handles reasoning as a separate \`reasoning_content\` channel; your visible text is the final answer only.
+- The proxy converts your blocks into the client's OpenAI \`tool_calls\` format; you will see tool results arrive as \`[tool result: ...]\` turns on the next prompt.
+- Legacy \`[tool_call]...[/tool_call]\` syntax is still accepted for backward compatibility, but prefer \`<tool_call>...</tool_call>\`.
+`;
 
 /** Brings the backend up: reuses OC_SERVER when one is configured, otherwise spawns
  *  `opencode serve` and waits until it answers. */
@@ -270,8 +500,9 @@ export async function start() {
     return;
   }
   if (OC_BIN === "opencode" && !Bun.which("opencode")) throw new Error("opencode binary not found - set OC_BIN or install opencode");
-  const mkdir = Bun.spawn(["mkdir", "-p", OC_WORKDIR], { stdout: "ignore", stderr: "ignore" });
+  const mkdir = Bun.spawn(["mkdir", "-p", `${OC_WORKDIR}/.opencode/agents`], { stdout: "ignore", stderr: "ignore" });
   if ((await mkdir.exited) !== 0) throw new Error(`could not create OC_WORKDIR: ${OC_WORKDIR}`);
+  await Bun.write(`${OC_WORKDIR}/.opencode/agents/bypass-lite.md`, BYPASS_LITE_AGENT);
 
   const password = "oc-" + randomHex(12);
   const child = Bun.spawn([OC_BIN, "serve", "--port", "0", "--hostname", "127.0.0.1"], {
