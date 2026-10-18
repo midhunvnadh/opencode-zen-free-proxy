@@ -189,7 +189,8 @@ describe("telling the model about the caller's functions", () => {
     const text = toolInstructions([weather]);
     expect(text).toContain("get_weather: current weather");
     expect(text).toContain('{"type":"object","properties":{"city":{"type":"string"}}}');
-    expect(text).toContain("```tool_call");
+    expect(text).toContain("<tool_call>");
+    expect(text).toContain("[client tools]");
     expect(text).toContain("none of your own tools are available");
   });
 

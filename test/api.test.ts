@@ -345,6 +345,22 @@ describe("tool calling", () => {
     expect(frames.at(-1)?.data).toBe("[DONE]");
   });
 
+  it("streams prose before a tool call followed by the tool call and finish_reason tool_calls", async () => {
+    calling('Let me check that for you.\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>');
+    backend.deltas = [
+      { kind: "text", text: "Let me check that for you.\n" },
+      { kind: "text", text: '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>' },
+    ];
+    const res = await post("/v1/chat/completions", ask({ tools: weather, stream: true }));
+    const { frames } = await sse(res);
+    const textDeltas = frames.map((f) => f.data?.choices?.[0]?.delta?.content).filter(Boolean);
+    expect(textDeltas.join("")).toContain("Let me check that for you.");
+    const call = frames.flatMap((f) => f.data?.choices?.[0]?.delta?.tool_calls ?? [])[0];
+    expect(call).toMatchObject({ type: "function", function: { name: "get_weather" } });
+    expect(frames.filter((f) => f.data?.choices?.[0]?.finish_reason).at(-1)?.data.choices[0].finish_reason).toBe("tool_calls");
+    expect(frames.at(-1)?.data).toBe("[DONE]");
+  });
+
   it("still streams live deltas when no tools were offered", async () => {
     backend.deltas = [{ kind: "text", text: "hi " }, { kind: "text", text: "there" }];
     const res = await post("/v1/chat/completions", ask({ stream: true }));

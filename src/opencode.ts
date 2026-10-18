@@ -140,8 +140,13 @@ async function createSession(modelId: string, intercept: boolean) {
  *  rule never ends the turn on its own, so the two are waited for together and the first
  *  one to arrive wins. Only a session whose tools are blocked can produce a request, so
  *  `poll` says whether the watch is worth opening. Resolves with the pending request, or
- *  null when the turn ended by itself. */
-async function awaitTurn(sid: string, poll: boolean) {
+ *  null when the turn ended by itself.
+ *
+ *  When `poll` is false (no client tools), /wait may return early while opencode's own
+ *  built-in tools are still executing. In that case we loop /wait until the agentic
+ *  loop is truly finished so the caller gets the model's final reply, not the mid-loop
+ *  "Let me do X" stub. */
+async function awaitTurn(sid: string, poll: boolean): Promise<{ asked: any; message: any }> {
   let done = false;
   let wake = () => {};
   const settled = new Promise<void>((r) => (wake = r));
@@ -150,18 +155,34 @@ async function awaitTurn(sid: string, poll: boolean) {
         while (!done) {
           const r = await request("GET", `/api/session/${sid}/permission`);
           const pending = (Array.isArray(r.json?.data) ? r.json.data : []).find((p: any) => p?.source?.type === "tool");
-          if (pending) return pending;
+          if (pending) return { asked: pending, message: null };
           await Promise.race([sleep(POLL_MS), settled]);
         }
-        return null;
+        return { asked: null, message: null };
       })()
-    : new Promise<null>(() => {});
+    : new Promise<{ asked: any; message: any }>(() => {});
   const turn = (async () => {
-    const wait = await request("POST", `/api/experimental/session/${sid}/wait`);
-    if (wait.status !== 204 && wait.status !== 200) throw upstreamError(wait);
-    done = true;
-    wake();
-    return null;
+    // Loop /wait so that if opencode's own built-in tools are running the proxy
+    // stays parked until the full agentic loop completes, not just the first generation.
+    while (true) {
+      const wait = await request("POST", `/api/experimental/session/${sid}/wait`);
+      if (wait.status !== 204 && wait.status !== 200) throw upstreamError(wait);
+      const msg = await latestAssistant(sid);
+      const parts: any[] = Array.isArray(msg?.content) ? msg.content : Array.isArray(msg?.parts) ? msg.parts : [];
+      const stillRunning = parts.some((p: any) => {
+        if (p?.type === "tool" || p?.type === "tool_use") {
+          const st = p?.state?.status ?? p?.status;
+          return !st || st === "running" || st === "pending";
+        }
+        return false;
+      });
+      if (!stillRunning) {
+        done = true;
+        wake();
+        return { asked: null, message: msg };
+      }
+      await sleep(POLL_MS);
+    }
   })();
   return Promise.race([turn, watching]);
 }
@@ -192,13 +213,12 @@ async function runPrompt(sid: string, text: string, system: string, names: strin
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     const pr = await request("POST", `/api/session/${sid}/prompt`, { text: system ? `System: ${system}\n\n${text}` : text });
     if (pr.status !== 200 && pr.status !== 202) throw upstreamError(pr);
-    const asked = await awaitTurn(sid, intercept);
+    const { asked, message } = await awaitTurn(sid, intercept);
     if (asked) {
       await reject(sid, asked.id);
       text = pointElsewhere(asked.action, names);
       continue;
     }
-    const message = await latestAssistant(sid);
     // A function the client never declared is not its to run, so the block naming it is
     // not handed over. The model is told so and answers properly, rather than the
     // caller's machine being handed a call it never offered.
@@ -208,6 +228,7 @@ async function runPrompt(sid: string, text: string, system: string, names: strin
   }
   throw new HttpError(502, "the model kept reaching for tools it does not have");
 }
+
 
 /** Runs one turn. Without a session key the conversation is stateless and torn down
  *  again; with one the session is kept, so the first turn replays the transcript the

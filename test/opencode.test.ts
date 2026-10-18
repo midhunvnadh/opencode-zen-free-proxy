@@ -31,6 +31,8 @@ const fake = {
   created: [] as any[],
   rejected: [] as string[],
   deleted: [] as string[],
+  steps: [] as any[],
+  waits: 0,
 };
 
 const CALL_ID = "call_1";
@@ -63,6 +65,8 @@ beforeEach(async () => {
   fake.created = [];
   fake.rejected = [];
   fake.deleted = [];
+  fake.steps = [];
+  fake.waits = 0;
   permission = null;
   finished = null;
   message = null;
@@ -97,10 +101,11 @@ beforeEach(async () => {
       return json({ id: "msg_1" });
     }
     if (path.endsWith("/wait")) {
+      fake.waits++;
       // A blocked tool never ends the turn on its own, which is what the proxy races.
       if (permission) await new Promise<void>((resolve) => (waiter = resolve));
-      // The answer only exists once the turn is over.
-      message = finished;
+      // The answer only exists once the turn is over, or next step in an agentic loop
+      message = fake.steps.length > 0 ? fake.steps.shift() : finished;
       return { status: 204, text: async () => "" };
     }
     if (path.endsWith("/permission") && init.method === "GET") {
@@ -135,6 +140,91 @@ describe("a session without client tools", () => {
   it("never asks for permission", async () => {
     await askModel({ key: null, modelId: "big-pickle", system: "", transcript: "", lastUserText: "hello" });
     expect(fake.rejected).toEqual([]);
+  });
+
+  it("waits for an agentic loop to finish when opencode runs built-in tools", async () => {
+    // Step 1: Model emits text "Let me check that for you." + tool in running state
+    const interimMessage = {
+      id: "msg_1",
+      type: "assistant",
+      time: { created: 1 },
+      content: [
+        { type: "text", text: "Let me check that for you." },
+        { type: "tool", id: "call_1", name: "bash", state: { status: "running", input: { command: "ls" } } },
+      ],
+      tokens: { input: 5, output: 2 },
+      finish: "stop",
+    };
+    // Step 2: Final message after tool execution completes
+    const finalMessage = {
+      id: "msg_2",
+      type: "assistant",
+      time: { created: 2 },
+      content: [
+        { type: "text", text: "Here are the files: a.txt, b.txt." },
+        { type: "tool", id: "call_1", name: "bash", state: { status: "completed", input: { command: "ls" } } },
+      ],
+      tokens: { input: 10, output: 8 },
+      finish: "stop",
+    };
+
+    fake.steps = [interimMessage, finalMessage];
+
+    const message = await askModel({
+      key: null,
+      modelId: "big-pickle",
+      system: "",
+      transcript: "",
+      lastUserText: "list files",
+    });
+
+    // Stayed parked across /wait calls until the tool finished
+    expect(fake.waits).toBe(2);
+    // Returns the final answer, NOT the interim stub
+    expect(message.content[0].text).toBe("Here are the files: a.txt, b.txt.");
+  });
+
+  it("waits through multiple pending/running steps before returning the completed reply", async () => {
+    const step1 = {
+      id: "msg_1",
+      type: "assistant",
+      time: { created: 1 },
+      content: [
+        { type: "text", text: "Let me run step 1." },
+        { type: "tool_use", id: "call_1", name: "fetch", status: "pending", input: { url: "http://example.com" } },
+      ],
+    };
+    const step2 = {
+      id: "msg_2",
+      type: "assistant",
+      time: { created: 2 },
+      content: [
+        { type: "text", text: "Let me process data." },
+        { type: "tool_use", id: "call_2", name: "process", status: "running", input: {} },
+      ],
+    };
+    const finalStep = {
+      id: "msg_3",
+      type: "assistant",
+      time: { created: 3 },
+      content: [
+        { type: "text", text: "All steps completed successfully." },
+        { type: "tool_use", id: "call_2", name: "process", status: "completed", input: {} },
+      ],
+    };
+
+    fake.steps = [step1, step2, finalStep];
+
+    const message = await askModel({
+      key: null,
+      modelId: "big-pickle",
+      system: "",
+      transcript: "",
+      lastUserText: "do multi-step task",
+    });
+
+    expect(fake.waits).toBe(3);
+    expect(message.content[0].text).toBe("All steps completed successfully.");
   });
 });
 

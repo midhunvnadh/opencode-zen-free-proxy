@@ -161,13 +161,13 @@ export function toolInstructions(declared: ToolSpec[], toolChoice?: any): string
     }
   }
 
-  return `You can call functions on the caller's machine, and none of your own tools are available. When you need one, reply with a single fenced block and nothing after it:
+  return `You can call functions on the caller's machine, and none of your own tools are available. When you need one, emit exactly this block (JSON on one line, no text after the closing tag):
 
-\`\`\`tool_call
-{"name": "<the function>", "arguments": {<its arguments>}}
-\`\`\`
+<tool_call>
+{"name": "<the function>", "arguments": <its arguments>}
+</tool_call>
 
-The caller's functions:
+[client tools]
 ${list}${requirement}`;
 }
 
